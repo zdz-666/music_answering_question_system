@@ -1,0 +1,110 @@
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import rag
+import json
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import jieba
+from rouge_score import rouge_scorer
+import numpy as np
+from typing import List
+
+class tokenizer:
+    def tokenize(self,text):
+        return list(jieba.cut(text.strip()))
+
+def calculate_bleu(llm_text: str, reference_text: List[str]):  
+    tokenizer_instance = tokenizer()
+    llm_text_tokens = tokenizer_instance.tokenize(llm_text)
+    reference_text_tokens = [tokenizer_instance.tokenize(text) for text in reference_text]
+
+    smooth_method = SmoothingFunction().method4
+
+    bleu_score = sentence_bleu(reference_text_tokens, llm_text_tokens, smoothing_function=smooth_method)
+    return bleu_score
+
+def calculate_rouge(llm_text: str, reference_text: List[str]):
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], tokenizer=tokenizer(), use_stemmer=False)
+    all_results = {}
+
+    for rouge_type in ['rouge1', 'rouge2', 'rougeL']:
+        all_results[rouge_type] = {'precision': [], 'recall': [], 'fmeasure': []}
+
+    for ref in reference_text:
+        scores = scorer.score(ref, llm_text)
+        print(f"scores: {scores}")
+
+        for rouge_type in ['rouge1', 'rouge2', 'rougeL']:
+            all_results[rouge_type]['precision'].append(scores[rouge_type].precision)
+            all_results[rouge_type]['recall'].append(scores[rouge_type].recall)
+            all_results[rouge_type]['fmeasure'].append(scores[rouge_type].fmeasure)
+   
+    final_results = {}
+    for rouge_type in ['rouge1', 'rouge2', 'rougeL']:
+        final_results[rouge_type]={
+            'precision': np.mean(all_results[rouge_type]['precision']),
+            'recall': np.mean(all_results[rouge_type]['recall']),
+            'fmeasure': np.mean(all_results[rouge_type]['fmeasure'])
+        }
+    return final_results
+
+def llm_evaluator(query: str, reference_text: str, generated_answer: str):
+    llm = ChatOpenAI(
+    model="",
+    api_key="",
+    base_url="",
+    temperature=0.1
+)
+
+    prompt = """你是一个RAG系统答案质量的评估专家。请严格根据提供的“用户问题”和“参考文本”，评估“生成答案”的忠诚度。
+忠诚度定义：评估“生成答案”中的事实、主张与细节，是否严格源自“参考文本”，且没有添加未提及的信息、没有歪曲原意、也没有与参考文本矛盾。
+评分规则：
+0分（不忠实）：生成答案包含参考文本中未提及的关键事实或细节，和/或与参考文本中的信息存在直接矛盾。
+1分（部分忠实）：生成答案的核心信息基于参考文本，但包含部分未经证实的扩展、不精确的表述，或遗漏了关键限制条件。
+2分（完全忠实）：生成答案中的所有事实和细节均可在参考文本中找到明确依据或合理推断，没有添加外部知识，也没有歪曲或矛盾。
+评估步骤：
+仔细阅读“用户问题”“参考文本”和“生成答案”。
+对照上述“评分规则”，判断“生成答案”的忠诚度等级。
+重要：在评分前，必须先以“[依据]”为标题，简要列举你的判断依据（例如，指出哪部分信息无依据或矛盾，或说明为何认为完全忠实）。
+最终，以JSON格式输出结果，包含score(0,1,2)和justification(你的判断依据摘要) 两个字段。
+待评估内容：
+[用户问题]:{query}
+[参考文本]:{reference_text}
+[生成答案]:{generated_answer}
+输出格式（严格按照此JSON格式输出，不要有任何其他文字）：
+{{
+"score" : 2,
+"justification": "你的判断依据" 
+}}
+"""
+    prompt_template = ChatPromptTemplate.from_template(prompt)
+    message = prompt_template.format(query=query, reference_text=reference_text, generated_answer=generated_answer)
+    response = llm.invoke(message)
+    return response.content
+
+def rag_process(query: str):
+    context, result_content = rag.get_result_evaluate(
+        query=query,
+        use_web_search=True,
+        use_knowledge_base=True,
+    )
+    result = llm_evaluator(
+        query=query,
+        reference_text=context,
+        generated_answer=result_content,
+    )
+    result = json.loads(result)
+    score = result.get("score")
+    justification = result.get("justification")
+    text = []
+    text.append(context)
+    bleu_score = calculate_bleu(result_content, text)
+    rouge_score = calculate_rouge(result_content, text)
+
+    print(f"bleu分数: {bleu_score}")
+    print(f"rouge分数: {rouge_score}")
+    print(f"忠诚度得分: {score}, 判断依据: {justification}")
+    return None
+
+if __name__ == "__main__":
+    query = input("请输入用户问题: ")
+    rag_process(query)
