@@ -12,9 +12,9 @@ class Route(BaseModel):
 def get_router_collection(query):
     
     llm = ChatOpenAI(
-    model="deepseek-ai/DeepSeek-V3.2",
-    api_key="sk-bysjigcjhbwdxlekmdzhcpuvwhssqjcflkcoexbaauauzpms",
-    base_url="https://api.siliconflow.cn/v1",
+    model="",
+    api_key="",
+    base_url="",
     temperature=0.1
 )
     executor = llm.with_structured_output(Route)
