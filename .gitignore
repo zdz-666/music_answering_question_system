@@ -1,0 +1,16 @@
+# Milvus 运行时数据（容器启动时自动生成，机器本地状态，勿提交）
+milvus-standalone/volumes/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# 密钥与环境变量
+.env
