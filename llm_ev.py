@@ -1,4 +1,3 @@
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 import rag
 import json
@@ -7,6 +6,8 @@ import jieba
 from rouge_score import rouge_scorer
 import numpy as np
 from typing import List
+
+from config import get_chat_model
 
 class tokenizer:
     def tokenize(self,text):
@@ -48,12 +49,7 @@ def calculate_rouge(llm_text: str, reference_text: List[str]):
     return final_results
 
 def llm_evaluator(query: str, reference_text: str, generated_answer: str):
-    llm = ChatOpenAI(
-    model="",
-    api_key="",
-    base_url="",
-    temperature=0.1
-)
+    llm = get_chat_model()
 
     prompt = """你是一个RAG系统答案质量的评估专家。请严格根据提供的“用户问题”和“参考文本”，评估“生成答案”的忠诚度。
 忠诚度定义：评估“生成答案”中的事实、主张与细节，是否严格源自“参考文本”，且没有添加未提及的信息、没有歪曲原意、也没有与参考文本矛盾。

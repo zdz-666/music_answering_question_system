@@ -2,37 +2,12 @@ import rag
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel
-from langchain_core.prompts import ChatPromptTemplate
+from typing import Optional
 from datetime import datetime
-import base64
+from models import QueryRequest, ChatMessage, ChatResponse, ChatHistoryResponse
 import zipfile
 import io
 import re
-
-class QueryRequest(BaseModel):
-    question: str
-    session_id: Optional[str] = None
-    use_web_search: bool = True
-    use_knowledge_base: bool = True
-    file_content: Optional[str] = None
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-    timestamp: Optional[str] = None
-
-class ChatResponse(BaseModel):
-    answer: str
-    session_id: str
-    timestamp: str
-
-class ChatHistoryResponse(BaseModel):
-    session_id: str
-    messages: List[ChatMessage]
-    total: int
-    timestamp: str
 
 
 app = FastAPI(

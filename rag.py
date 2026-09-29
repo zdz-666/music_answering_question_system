@@ -1,25 +1,23 @@
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from tavily import TavilyClient
 from collection_router import get_router_collection
-from main import QueryRequest
+from models import QueryRequest
 from dynamic_chunk import SemanticChunker
-from data_storage import milvus_similarity_search, create_vector_store_loaded
+from data_storage import vector_similarity_search, load_vector_store
+from config import (
+    RERANK_BASE_URL,
+    RERANK_MODEL,
+    TAVILY_MAX_RESULTS,
+    get_chat_model,
+    get_rerank_api_key,
+    get_tavily_api_key,
+)
 import requests
 import math
 
 
-def init_llm():
-    llm = ChatOpenAI(
-    model="your model name",
-    api_key="your apikey",
-    base_url="your baseurl",
-    temperature=0.1
-)
-    return llm
-
 def query_rewriting(query: str):
-    llm = init_llm()
+    llm = get_chat_model()
     prompt = """
 你是一个专业的查询优化助手。你的任务是将用户输入的自然语言查询重写为更适合向量数据库检索的形式。
 
@@ -49,7 +47,7 @@ def query_rewriting(query: str):
 
 
 def web_rewriting(query: str):
-    llm = init_llm()
+    llm = get_chat_model()
     prompt = """
 你是一个专业的“搜索查询净化与关键词提取”助手。你的任务是将用户凌乱、口语化、包含无关信息的原始查询，转化为简洁、精准、适合直接用于搜索引擎（如Google、Bing、百度）的关键词或短语。
 
@@ -89,8 +87,8 @@ def web_rewriting(query: str):
 
 
 def web_search(query: str):
-    tavily_client = TavilyClient(api_key="your apikey")
-    response = tavily_client.search(query=query, max_results=5)
+    tavily_client = TavilyClient(api_key=get_tavily_api_key())
+    response = tavily_client.search(query=query, max_results=TAVILY_MAX_RESULTS)
     return response.get("results")[0]
 
 def get_web_search(query):
@@ -99,20 +97,20 @@ def get_web_search(query):
         return web_result
 
 def rerank(documents, query):
-    documents = [doc.page_content for doc, score in documents]
+    documents = [doc.page_content for doc in documents]
     l = len(documents)
     num_to_extract = math.ceil(l * 0.5)
 
     if l == 0:
         return []
 
-    api_url = "https://api.siliconflow.cn/v1/rerank"
+    api_url = RERANK_BASE_URL
     headers = {
-        "Authorization": "Bearer your apikey",
+        "Authorization": f"Bearer {get_rerank_api_key()}",
         "Content-Type": "application/json",
     }
     payload = {
-    "model": "Qwen/Qwen3-Reranker-8B",
+    "model": RERANK_MODEL,
     "query": query,
     "documents": documents
 }
@@ -134,7 +132,7 @@ def get_vector_search(query):
         result = []
         query_change = query_rewriting(query)
         for co_name in collection_list:
-             vector_result = milvus_similarity_search(co_name, query_change, k=6)
+             vector_result = vector_similarity_search(co_name, query_change, k=6)
              result_list = rerank(vector_result, query_change)
              combined_content = ""
              for i, doc in enumerate(result_list):
@@ -152,7 +150,7 @@ def get_vector_search(query):
         return vector_result
 
 def self_reflection(query, vector_result, web_result):
-    llm = init_llm()
+    llm = get_chat_model()
     prompt_template = """
         你是一个信息相关性过滤器。给定用户提问和在用户知识库与网络中检索到的信息，请从用户知识库、网络检索到的信息、历史对话记录中提炼出与用户提问相关的信息。如果没有相关信息，请返回“无相关信息”。
         用户提问:{query}
@@ -205,23 +203,23 @@ def get_result(query: QueryRequest, history_string: str):
                                        file_content=query.file_content,
                                        context=context)
     
-     llm = init_llm()
+     llm = get_chat_model()
      result = llm.invoke(messages)
      return result
 
 def add_self_introduction(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
-    vector_store = create_vector_store_loaded("self_introduction")
+    vector_store = load_vector_store("self_introduction")
     vector_store.add_documents(docs)
 
 def add_music_analysis(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
-    vector_store = create_vector_store_loaded("music_analysis")
+    vector_store = load_vector_store("music_analysis")
     vector_store.add_documents(docs)
 
 def add_music_list(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
-    vector_store = create_vector_store_loaded("music_list")
+    vector_store = load_vector_store("music_list")
     vector_store.add_documents(docs)
 
 def get_result_evaluate(query: str,use_web_search: bool, use_knowledge_base: bool):
@@ -258,6 +256,6 @@ def get_result_evaluate(query: str,use_web_search: bool, use_knowledge_base: boo
                                        question=query, 
                                        context=context)
     
-     llm = init_llm()
+     llm = get_chat_model()
      result = llm.invoke(messages)
      return context, result.content

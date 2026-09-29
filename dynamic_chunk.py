@@ -1,16 +1,13 @@
 from langchain_core.documents import Document
 import torch
-from langchain_openai import OpenAIEmbeddings
 import numpy as np
 import re
 
+from config import get_embeddings
+
 class SemanticChunker:
     def __init__(self, overlap_size, max_chunk_size):
-        self.embeddings_model = OpenAIEmbeddings(
-            model="",
-            api_key="",
-            base_url=""
-        )
+        self.embeddings_model = get_embeddings()
         self.overlap_size = overlap_size
         self.max_chunk_size = max_chunk_size
     
@@ -100,11 +97,3 @@ class SemanticChunker:
 
         return documents
 
-
-'''
-#测试用
-chunker = SemanticChunker(overlap_size=0, max_chunk_size=500)
-docs = """人工智能（Artificial Intelligence，AI）是计算机科学的一个分支，旨在创造能够执行通常需要人类智能的任务的机器。这些任务包括视觉感知、语音识别、决策制定和语言翻译。机器学习是人工智能的一个子领域，它使计算机能够在没有明确编程的情况下学习。机器学习算法从数据中构建数学模型，用于进行预测或决策。深度学习是机器学习的一个子集，它使用多层神经网络。与传统的机器学习方法相比，深度学习在图像识别、自然语言处理等领域表现出色。然而，深度学习模型需要大量的计算资源和数据。没有足够的数据，深度学习模型可能无法达到预期的性能。张德志是大帅哥。"""
-result = chunker.chunk_document(docs)
-print(result)
-'''

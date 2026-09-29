@@ -1,5 +1,5 @@
-# Milvus 运行时数据（容器启动时自动生成，机器本地状态，勿提交）
-milvus-standalone/volumes/
+# Chroma 向量库数据（本地运行时生成，勿提交）
+chroma_db/
 
 # Python
 __pycache__/

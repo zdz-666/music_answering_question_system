@@ -1,7 +1,9 @@
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from typing_extensions import Literal, List
 from pydantic import BaseModel, Field
+
+from config import get_chat_model
+
 
 class Route(BaseModel):
     question_types: List[Literal["self_introduction", "music_analysis", "music_list"]] = Field(
@@ -9,14 +11,10 @@ class Route(BaseModel):
         description="问题类型列表，可包含：self_introduction（自我介绍）、music_analysis（音乐分析）、music_list（歌单列表）中的一个或多个"
     )
 
+
 def get_router_collection(query):
-    
-    llm = ChatOpenAI(
-    model="",
-    api_key="",
-    base_url="",
-    temperature=0.1
-)
+
+    llm = get_chat_model()
     executor = llm.with_structured_output(Route)
     prompt = """
     你是一个智能路由模型，你的任务是根据用户的查询，判断应该将查询路由到哪个集合。
@@ -37,10 +35,3 @@ def get_router_collection(query):
     result = executor.invoke(messages)
 
     return result.question_types
-
-while True:
-    query = input("用户问题：")
-    if query == "exit":
-        break
-    collections = get_router_collection(query)
-    print(f"\n路由集合：{collections}\n")
