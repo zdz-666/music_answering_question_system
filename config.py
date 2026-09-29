@@ -32,6 +32,15 @@ def _env(name: str, default: str | None = None) -> str:
 RERANK_MODEL = os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-8B")
 RERANK_BASE_URL = os.getenv("RERANK_BASE_URL", "https://api.siliconflow.cn/v1/rerank")
 TAVILY_MAX_RESULTS = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
+TAVILY_API_URL = os.getenv("TAVILY_API_URL", "https://api.tavily.com/search")
+
+# ---- 外部服务的超时与重试 ----
+# 超时是必须的：原先 requests.post 不带 timeout，上游挂住会一直占着工作线程
+# 单次 10s 对重排/搜索足够（正常 1~3s），最坏情况 = 超时 x (HTTP_RETRIES + 1)
+RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "10"))
+WEB_SEARCH_TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "10"))
+# 重试次数（不含首次），即最多尝试 HTTP_RETRIES + 1 次
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 
 # Chroma 持久化目录：向量库数据落在这里，已在 .gitignore 中排除
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")

@@ -2,6 +2,7 @@ import rag
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from typing import Optional
 from datetime import datetime
 from models import QueryRequest, ChatMessage, ChatResponse, ChatHistoryResponse
@@ -93,8 +94,11 @@ async def chat(query: QueryRequest):
     session_id = get_session(query.session_id)
     history_string = get_history_str(session_id)
 
+    # rag.get_result 是同步阻塞函数（内部是同步 LLM / requests / Chroma 调用），
+    # 直接在 async 端点里调用会占住事件循环，同一 worker 上的其它请求全部排队。
+    # 下沉到线程池后本进程才能并发处理请求；request_id 与 token 计量靠 contextvars 传递。
     with log_step("rag.total", session_id=session_id):
-        result = rag.get_result(query, history_string)
+        result = await run_in_threadpool(rag.get_result, query, history_string)
 
     add_message(session_id, ChatMessage(role="user", content=query.question))
     add_message(session_id, ChatMessage(role="assistant", content=result.content))
@@ -168,7 +172,7 @@ async def upload_file(
         history_string = get_history_str(session_id)
         
         with log_step("rag.total", session_id=session_id):
-            result = rag.get_result(query_request, history_string)
+            result = await run_in_threadpool(rag.get_result, query_request, history_string)
         
         add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
         add_message(session_id, ChatMessage(role="assistant", content=result.content))
@@ -184,10 +188,12 @@ async def upload_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件处理失败: {str(e)}")
 
+# 三个写入端点同样会阻塞：chunk_document 与 add_documents 内部要调 Embedding（网络往返），
+# 语料大时是秒级，同步执行会占住事件循环，因此一并下沉到线程池。
 @app.post("/api/knowledge/self-introduction")
 async def add_self_introduction(text: str = Form(...)):
     try:
-        rag.add_self_introduction(text)
+        await run_in_threadpool(rag.add_self_introduction, text)
         return {"message": "个人信息添加成功"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"添加失败: {str(e)}")
@@ -195,7 +201,7 @@ async def add_self_introduction(text: str = Form(...)):
 @app.post("/api/knowledge/music-analysis")
 async def add_music_analysis(text: str = Form(...)):
     try:
-        rag.add_music_analysis(text)
+        await run_in_threadpool(rag.add_music_analysis, text)
         return {"message": "音乐理解添加成功"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"添加失败: {str(e)}")
@@ -203,7 +209,7 @@ async def add_music_analysis(text: str = Form(...)):
 @app.post("/api/knowledge/music-list")
 async def add_music_list(text: str = Form(...)):
     try:
-        rag.add_music_list(text)
+        await run_in_threadpool(rag.add_music_list, text)
         return {"message": "歌单添加成功"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"添加失败: {str(e)}")

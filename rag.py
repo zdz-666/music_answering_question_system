@@ -1,20 +1,82 @@
 from langchain_core.prompts import ChatPromptTemplate
-from tavily import TavilyClient
 from collection_router import get_router_collection
 from models import QueryRequest
 from dynamic_chunk import SemanticChunker
 from data_storage import vector_similarity_search, load_vector_store
 from config import (
+    HTTP_RETRIES,
     RERANK_BASE_URL,
     RERANK_MODEL,
+    RERANK_TIMEOUT,
+    TAVILY_API_URL,
     TAVILY_MAX_RESULTS,
+    WEB_SEARCH_TIMEOUT,
     get_chat_model,
     get_rerank_api_key,
     get_tavily_api_key,
 )
 from observability import log_step, logger
-import requests
+import httpx
 import math
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+
+class _RetryableServiceError(RuntimeError):
+    """上游临时故障（超时 / 网络错误 / 5xx / 429），重试有意义。"""
+
+
+def _log_retry(retry_state) -> None:
+    exc = retry_state.outcome.exception()
+    logger.warning(
+        "http.retry",
+        extra={
+            "fields": {
+                "attempt": retry_state.attempt_number,
+                "max_attempts": HTTP_RETRIES + 1,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            }
+        },
+    )
+
+
+@retry(
+    stop=stop_after_attempt(HTTP_RETRIES + 1),
+    wait=wait_exponential(multiplier=0.5, max=4),
+    retry=retry_if_exception_type(_RetryableServiceError),
+    before_sleep=_log_retry,
+    reraise=True,
+)
+def _post_json(
+    url: str,
+    payload: dict,
+    headers: dict | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """POST JSON：必带超时，失败按指数退避重试。
+
+    只有超时、网络错误、5xx、429 会重试——4xx 是请求本身的问题（比如密钥错），重试无意义，
+    直接抛出去，避免把 3 次尝试都浪费在一个必然失败的请求上。
+    """
+    try:
+        response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise _RetryableServiceError(f"连接失败: {type(exc).__name__}: {exc}") from exc
+
+    if response.status_code >= 500 or response.status_code == 429:
+        raise _RetryableServiceError(f"HTTP {response.status_code}: {response.text[:200]}")
+
+    if response.is_error:
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise _RetryableServiceError(f"响应不是合法 JSON: {response.text[:200]}") from exc
 
 
 def query_rewriting(query: str):
@@ -91,8 +153,16 @@ def web_rewriting(query: str):
 
 def web_search(query: str):
     with log_step("web_search", provider="tavily", max_results=TAVILY_MAX_RESULTS):
-        tavily_client = TavilyClient(api_key=get_tavily_api_key())
-        response = tavily_client.search(query=query, max_results=TAVILY_MAX_RESULTS)
+        # 直接调 Tavily 的 HTTP 接口，省掉 SDK，超时与重试统一由 _post_json 兜住
+        response = _post_json(
+            TAVILY_API_URL,
+            {
+                "api_key": get_tavily_api_key(),
+                "query": query,
+                "max_results": TAVILY_MAX_RESULTS,
+            },
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
     return response.get("results")[0]
 
 def get_web_search(query):
@@ -103,12 +173,10 @@ def get_web_search(query):
 def rerank(documents, query):
     documents = [doc.page_content for doc in documents]
     l = len(documents)
-    num_to_extract = math.ceil(l * 0.5)
-
     if l == 0:
         return []
 
-    api_url = RERANK_BASE_URL
+    num_to_extract = math.ceil(l * 0.5)
     headers = {
         "Authorization": f"Bearer {get_rerank_api_key()}",
         "Content-Type": "application/json",
@@ -119,9 +187,16 @@ def rerank(documents, query):
     "documents": documents
 }
     with log_step("rerank", model=RERANK_MODEL, docs_in=l, docs_keep=num_to_extract):
-        response = requests.post(api_url, json=payload, headers=headers)
-        text = response.json()
-    results = text.get("results", [])
+        try:
+            text = _post_json(
+                RERANK_BASE_URL, payload, headers, timeout=RERANK_TIMEOUT
+            )
+        except Exception as exc:
+            # 重排只是让排序更准的增强步骤，上游挂掉不该把整条问答打成 500。
+            # 退化为混合检索的原顺序（EnsembleRetriever 的 RRF 排序）截断。
+            return _degrade_rerank(documents, num_to_extract, exc)
+
+    results = text.get("results") or []
 
     docs = []
     for i, result in enumerate(results):
@@ -129,9 +204,29 @@ def rerank(documents, query):
             break
         idx = result.get("index")
 
-        docs.append(documents[idx])
+        if isinstance(idx, int) and 0 <= idx < l:
+            docs.append(documents[idx])
+
+    if not docs:
+        # 返回了 200 但结构对不上（网关错误页、字段改名等），同样退化为原序
+        return _degrade_rerank(documents, num_to_extract, f"响应中没有可用的 index（results={len(results)}）")
 
     return docs
+
+
+def _degrade_rerank(documents, num_to_extract, reason):
+    """重排不可用时按原顺序取前 N 条，并留下可检索的降级日志。"""
+    logger.warning(
+        "rerank.degraded",
+        extra={
+            "fields": {
+                "step": "rerank",
+                "reason": f"{reason}"[:300],
+                "docs_keep": num_to_extract,
+            }
+        },
+    )
+    return documents[:num_to_extract]
 
 
 def get_vector_search(query):

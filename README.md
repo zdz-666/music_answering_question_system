@@ -28,7 +28,7 @@
 | LLM 编排 | LangChain（`langchain-openai`、`langchain-chroma`、`langchain-classic`、`langchain-community`） |
 | 向量数据库 | ChromaDB 1.4.0（本地持久化，无需独立服务或 Docker） |
 | 检索 | Chroma 稠密检索 + BM25 稀疏检索，经 `EnsembleRetriever` 加权融合，再由 Reranker（SiliconFlow `Qwen/Qwen3-Reranker-8B`）截取前 50% |
-| 联网搜索 | Tavily |
+| 联网搜索 | Tavily HTTP 接口（用 `httpx` 直调，带超时与 `tenacity` 重试） |
 | 分词/评测 | jieba、nltk（BLEU）、rouge-score |
 | 前端 | React 19 + Create React App + axios |
 
@@ -112,7 +112,7 @@ ChromaDB 以嵌入式方式运行，数据直接落盘到 `CHROMA_PERSIST_DIR`�
 
 ```bash
 pip install fastapi uvicorn langchain langchain-openai langchain-chroma langchain-classic \
-    langchain-community chromadb rank-bm25 tavily-python requests jieba nltk rouge-score \
+    langchain-community chromadb rank-bm25 httpx tenacity jieba nltk rouge-score \
     numpy torch python-multipart python-dotenv
 ```
 
@@ -130,7 +130,8 @@ cp .env.example .env    # 然后填写 .env
 
 需要填写的变量见 [.env.example](file:///d:/bishe/.env.example)：`OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 `LLM_MODEL` / `EMBEDDING_MODEL`（对话与向量模型，OpenAI 兼容接口）、`TAVILY_API_KEY`（联网搜索）、
-`RERANK_API_KEY`（重排序）、`CHROMA_PERSIST_DIR`（向量库落盘目录，默认 `./chroma_db`）。
+`RERANK_API_KEY`（重排序）、`CHROMA_PERSIST_DIR`（向量库落盘目录，默认 `./chroma_db`）、
+`RERANK_TIMEOUT` / `WEB_SEARCH_TIMEOUT` / `HTTP_RETRIES`（外部调用的超时秒数与重试次数）。
 
 业务侧统一通过 `config.get_chat_model()`、`config.get_embeddings()` 取实例，
 因此换模型只需改一处。缺失变量会抛出带操作提示的 `RuntimeError`，
@@ -189,8 +190,10 @@ python llm_ev.py
 实现见 [observability.py](file:///d:/bishe/observability.py)。
 
 **公共字段**：`ts`、`level`、`logger`、`request_id`、`event`。
-`request_id` 由 [main.py](file:///d:/bishe/main.py#L34-L48) 的中间件按请求生成，存在 `contextvar` 里
+`request_id` 由 [main.py](file:///d:/bishe/main.py#L35-L49) 的中间件按请求生成，存在 `contextvar` 里
 贯穿整条调用链，业务函数无需层层传参，并回写到响应头 `X-Request-Id` 便于前端对齐。
+RAG 链路被下沉到线程池执行（见「注意事项」），`contextvar` 会随任务一起拷进工作线程，
+因此线程内产生的 `llm.usage`、`step.done` 仍带着同一个 `request_id`，也照常计入 `rag.total` 的合计。
 
 **事件类型**
 
@@ -199,6 +202,8 @@ python llm_ev.py
 | `step.start` / `step.done` / `step.error` | 单步开始、结束（含耗时）、异常 | `step`、`elapsed_ms`、`input_tokens`、`output_tokens`、`llm_calls`、`cost_usd` |
 | `llm.usage` | 每次 LLM 调用结束 | `step`、`model`、`input_tokens`、`output_tokens`、`total_tokens`、`cost_usd` |
 | `request.status` | HTTP 响应状态码 | `status_code` |
+| `http.retry` | 外部 HTTP 调用失败后即将重试 | `attempt`、`max_attempts`、`error` |
+| `rerank.degraded` | 重排服务不可用，退化为检索原序 | `step`、`reason`、`docs_keep` |
 | `self_reflection.result` | 自反思过滤后的文本 | `content` |
 | `collection.create` / `collection.drop` | 知识库集合操作结果 | `collection`、`result`、`docs` |
 
@@ -237,7 +242,22 @@ for r in sorted(done, key=lambda x: -x.get('elapsed_ms', 0))[:10]:
 
 ## 注意事项
 
-- 会话数据存于内存字典 `sessions`，重启后丢失，且未做持久化与并发保护。
+- 会话数据存于内存字典 `sessions`，重启后丢失，且未做持久化与并发保护；`uvicorn --workers 2`
+  时每个 worker 各存一份，会话数据会错乱（`get_session` 里的 `len(sessions)` 后缀在不同进程
+  还会算出相同 id）。需要多 worker 时应换成 Redis 等外部存储。
+- 耗时的业务函数都是同步实现（LLM、`requests`、Chroma 都没有异步 API），直接在 `async def`
+  端点里调用会占住事件循环，同一 worker 上的请求只能排队。现已用 `run_in_threadpool` 下沉到
+  线程池：RAG 链路在 [chat](file:///d:/bishe/main.py#L97-L101) / [upload](file:///d:/bishe/main.py#L174-L175)，
+  知识库写入在 [三个 knowledge 端点](file:///d:/bishe/main.py#L193-L215)
+  （`chunk_document` 与 `add_documents` 内部要调 Embedding，语料大时是秒级）。
+  线程上限由 anyio 默认的 40 控制，超出后新请求会排队等待空闲线程。
+- 外部调用统一走 `rag._post_json`，都带超时并做指数退避重试：只对超时、网络错误、5xx、429 重试，
+  4xx（比如密钥错）直接失败，不浪费尝试。最坏耗时 ≈ 超时秒数 × (`HTTP_RETRIES` + 1)。
+- 重排是增强步骤，不是必需项：服务不可用（超时 / 5xx / 返回结构对不上）时退化为混合检索的
+  原顺序并截断，本次问答照样出结果，同时打 `rerank.degraded` 警告。联网搜索失败仍会向上抛 500，
+  未做降级——搜索结果是主链路输入，静默降级会让答案在无凭据的情况下生成。
+- `web_search` 只取 Tavily 返回的第一条结果（`results[0]`），命中为空列表时会抛 `IndexError`；
+  这是既有行为，未纳入本次改动。
 - CORS 当前为 `allow_origins=["*"]`，仅适合本地开发。
 - 上传解析仅处理 `.docx`（本质是 zip 内 XML），其它格式不会提取到正文。
 - 混合检索中的 BM25 索引在每次检索时从集合内全量文档重建（Chroma 只存稠密向量），
