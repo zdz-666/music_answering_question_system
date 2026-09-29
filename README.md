@@ -44,6 +44,7 @@ bishe/
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
 ├── config.py               # 模型 / 密钥 / Chroma 路径的统一配置入口
+├── observability.py        # 结构化日志：JSON 格式、request_id、分步耗时、token 成本
 ├── models/                 # 接口层与业务层共用的 Pydantic 数据结构
 ├── .env.example            # 环境变量模板（复制为 .env 后填写）
 ├── llm_ev.py               # 评测脚本：BLEU / ROUGE / LLM 忠诚度
@@ -180,6 +181,60 @@ python llm_ev.py
 
 ---
 
+## 可观测性（结构化日志）
+
+链路有 6 次 LLM 调用与 3 次外部服务调用，为定位瓶颈全部输出结构化日志。
+
+**输出方式**：stdout，每行一条 JSON，非 JSON 日志不混入。级别用 `LOG_LEVEL` 控制。
+实现见 [observability.py](file:///d:/bishe/observability.py)。
+
+**公共字段**：`ts`、`level`、`logger`、`request_id`、`event`。
+`request_id` 由 [main.py](file:///d:/bishe/main.py#L34-L48) 的中间件按请求生成，存在 `contextvar` 里
+贯穿整条调用链，业务函数无需层层传参，并回写到响应头 `X-Request-Id` 便于前端对齐。
+
+**事件类型**
+
+| event | 说明 | 关键字段 |
+| --- | --- | --- |
+| `step.start` / `step.done` / `step.error` | 单步开始、结束（含耗时）、异常 | `step`、`elapsed_ms`、`input_tokens`、`output_tokens`、`llm_calls`、`cost_usd` |
+| `llm.usage` | 每次 LLM 调用结束 | `step`、`model`、`input_tokens`、`output_tokens`、`total_tokens`、`cost_usd` |
+| `request.status` | HTTP 响应状态码 | `status_code` |
+| `self_reflection.result` | 自反思过滤后的文本 | `content` |
+| `collection.create` / `collection.drop` | 知识库集合操作结果 | `collection`、`result`、`docs` |
+
+**已埋点的步骤**：`request`（请求级）→ `rag.total`（RAG 链路汇总）→
+`query_rewriting`、`collection_router`、`vector_search`、`rerank`、`web_search`、
+`web_rewriting`、`self_reflection`、`generate`。
+
+嵌套步骤的 token 与成本会向上累加，因此 `rag.total` 一行就是整条链路的合计。
+
+**定位慢点**：按 `elapsed_ms` 排序找出最慢的步骤
+
+```bash
+python main.py 2>&1 | python -c "
+import sys, json
+# 跳过 uvicorn 的纯文本行
+rows = [json.loads(l) for l in sys.stdin if l.startswith('{')]
+done = [r for r in rows if r.get('event') == 'step.done']
+for r in sorted(done, key=lambda x: -x.get('elapsed_ms', 0))[:10]:
+    print(f\"{r['elapsed_ms']:>9.1f}ms  {r['step']:<18} rid={r['request_id']}\")
+"
+```
+
+输出示例（按耗时降序，一眼看出瓶颈在 `generate`）：
+
+```text
+   4210.2ms  generate           rid=a1b2c3d4e5f6
+    320.5ms  query_rewriting    rid=a1b2c3d4e5f6
+     88.0ms  rerank             rid=a1b2c3d4e5f6
+```
+
+**成本折算**：`cost_usd` 需要配置单价才非零——在 `.env` 里填 `LLM_INPUT_PRICE_PER_MT` /
+`LLM_OUTPUT_PRICE_PER_MT`（每百万 token 单价）。未配置时只记录 token 数。
+注意当前只统计**对话模型**，Embedding 的 token 未计入（分块与检索各自会调用 Embedding）。
+
+---
+
 ## 注意事项
 
 - 会话数据存于内存字典 `sessions`，重启后丢失，且未做持久化与并发保护。
@@ -189,3 +244,6 @@ python llm_ev.py
   语料规模较大时会有额外开销；`data_storage.py` 的 `DENSE_WEIGHT` / `SPARSE_WEIGHT` 可调融合权重。
 - 向量库已从 Milvus 迁移到 ChromaDB，旧的 `milvus-standalone/` 与 Docker Compose 已移除，
   原 Milvus 中已录入的数据不会自动迁移，需要重新执行 `collection_create` 建库。
+- 应用日志为纯 JSON 行，但 uvicorn 自身的 access log 仍是纯文本且同样写 stdout，两者会混排。
+  需要管道里只留 JSON 时，用 `uvicorn main:app --no-access-log` 启动。
+- 日志里目前会记录自反思的完整文本（`self_reflection.result`），语料较私密时注意日志落盘范围。

@@ -12,6 +12,7 @@ from config import (
     get_rerank_api_key,
     get_tavily_api_key,
 )
+from observability import log_step, logger
 import requests
 import math
 
@@ -42,7 +43,8 @@ def query_rewriting(query: str):
 """
     rewriting_query = ChatPromptTemplate.from_template(prompt)
     messages = rewriting_query.format_messages(question=query)
-    result = llm.invoke(messages)
+    with log_step("query_rewriting", query_len=len(query)):
+        result = llm.invoke(messages)
     return result.content
 
 
@@ -82,13 +84,15 @@ def web_rewriting(query: str):
 """
     rewriting_query = ChatPromptTemplate.from_template(prompt)
     messages = rewriting_query.format_messages(question=query)
-    result = llm.invoke(messages)
+    with log_step("web_rewriting", query_len=len(query)):
+        result = llm.invoke(messages)
     return result.content
 
 
 def web_search(query: str):
-    tavily_client = TavilyClient(api_key=get_tavily_api_key())
-    response = tavily_client.search(query=query, max_results=TAVILY_MAX_RESULTS)
+    with log_step("web_search", provider="tavily", max_results=TAVILY_MAX_RESULTS):
+        tavily_client = TavilyClient(api_key=get_tavily_api_key())
+        response = tavily_client.search(query=query, max_results=TAVILY_MAX_RESULTS)
     return response.get("results")[0]
 
 def get_web_search(query):
@@ -114,8 +118,9 @@ def rerank(documents, query):
     "query": query,
     "documents": documents
 }
-    response = requests.post(api_url, json=payload, headers=headers)
-    text = response.json()
+    with log_step("rerank", model=RERANK_MODEL, docs_in=l, docs_keep=num_to_extract):
+        response = requests.post(api_url, json=payload, headers=headers)
+        text = response.json()
     results = text.get("results", [])
 
     docs = []
@@ -127,27 +132,34 @@ def rerank(documents, query):
         docs.append(documents[idx])
 
     return docs
-def get_vector_search(query):
-        collection_list = get_router_collection(query)
-        result = []
-        query_change = query_rewriting(query)
-        for co_name in collection_list:
-             vector_result = vector_similarity_search(co_name, query_change, k=6)
-             result_list = rerank(vector_result, query_change)
-             combined_content = ""
-             for i, doc in enumerate(result_list):
-                if i > 0:  
-                    combined_content += "\n"
-                combined_content += doc
-             result.append(combined_content)
 
-        vector_result = ""
-        for i, context in enumerate(result):
-             if i > 0:  
-                vector_result += "\n"
-             vector_result += context
-            
-        return vector_result
+
+def get_vector_search(query):
+    with log_step("collection_router"):
+        collection_list = get_router_collection(query)
+
+    result = []
+    query_change = query_rewriting(query)
+    for co_name in collection_list:
+        with log_step("vector_search", collection=co_name, k=6):
+            vector_result = vector_similarity_search(co_name, query_change, k=6)
+
+        result_list = rerank(vector_result, query_change)
+
+        combined_content = ""
+        for i, doc in enumerate(result_list):
+            if i > 0:
+                combined_content += "\n"
+            combined_content += doc
+        result.append(combined_content)
+
+    vector_result = ""
+    for i, context in enumerate(result):
+        if i > 0:
+            vector_result += "\n"
+        vector_result += context
+
+    return vector_result
 
 def self_reflection(query, vector_result, web_result):
     llm = get_chat_model()
@@ -163,8 +175,9 @@ def self_reflection(query, vector_result, web_result):
 """
     prompt = ChatPromptTemplate.from_template(prompt_template)
     messages = prompt.format_messages(query=query, vector_result=vector_result, web_result=web_result)
-    result = llm.invoke(messages)
-    print(f"self_reflection result: {result.content}")
+    with log_step("self_reflection", has_vector=bool(vector_result), has_web=bool(web_result)):
+        result = llm.invoke(messages)
+    logger.info("self_reflection.result", extra={"fields": {"content": result.content}})
     return result.content
 
 def get_result(query: QueryRequest, history_string: str):
@@ -204,7 +217,8 @@ def get_result(query: QueryRequest, history_string: str):
                                        context=context)
     
      llm = get_chat_model()
-     result = llm.invoke(messages)
+     with log_step("generate", has_file=bool(query.file_content)):
+         result = llm.invoke(messages)
      return result
 
 def add_self_introduction(text: str):
@@ -257,5 +271,6 @@ def get_result_evaluate(query: str,use_web_search: bool, use_knowledge_base: boo
                                        context=context)
     
      llm = get_chat_model()
-     result = llm.invoke(messages)
+     with log_step("generate"):
+         result = llm.invoke(messages)
      return context, result.content

@@ -7,6 +7,7 @@ from langchain_core.documents import Document
 
 from config import CHROMA_PERSIST_DIR, get_embeddings
 from dynamic_chunk import SemanticChunker
+from observability import logger
 
 # 混合检索的融合权重（稠密 : 稀疏）。
 # ChromaDB 没有内置 BM25，这里用 EnsembleRetriever 的加权 RRF 复现原先
@@ -49,9 +50,9 @@ def collection_create(url, collection_name):
 )
 
     if collection_name in list_collections():
-        print(f"{collection_name} 创建成功")
+        logger.info("collection.create", extra={"fields": {"collection": collection_name, "result": "success", "docs": len(split_docs)}})
     else:
-        print(f"{collection_name} 创建失败")
+        logger.error("collection.create", extra={"fields": {"collection": collection_name, "result": "failed"}})
 
     return vector_store
 
@@ -107,8 +108,8 @@ def drop_collection(collection_name):
     get_client().delete_collection(collection_name)
 
     if collection_name in list_collections():
-        print(f"{collection_name} 删除失败")
+        logger.error("collection.drop", extra={"fields": {"collection": collection_name, "result": "failed"}})
     else:
-        print(f"{collection_name} 删除成功")
+        logger.info("collection.drop", extra={"fields": {"collection": collection_name, "result": "success"}})
 
     return None

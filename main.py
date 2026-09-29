@@ -5,6 +5,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from datetime import datetime
 from models import QueryRequest, ChatMessage, ChatResponse, ChatHistoryResponse
+from observability import (
+    new_request_id,
+    set_request_id,
+    reset_request_id,
+    get_request_id,
+    log_step,
+    logger,
+)
 import zipfile
 import io
 import re
@@ -22,6 +30,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_logging(request, call_next):
+    """每个 HTTP 请求生成一个 request_id，贯穿整条 RAG 链路；结束时输出汇总。"""
+    token = set_request_id(new_request_id())
+    try:
+        with log_step("request", path=request.url.path, method=request.method):
+            response = await call_next(request)
+            logger.info(
+                "request.status",
+                extra={"fields": {"status_code": response.status_code}},
+            )
+        response.headers["X-Request-Id"] = get_request_id()
+        return response
+    finally:
+        reset_request_id(token)
 
 sessions = {}
 
@@ -68,7 +93,8 @@ async def chat(query: QueryRequest):
     session_id = get_session(query.session_id)
     history_string = get_history_str(session_id)
 
-    result = rag.get_result(query, history_string)
+    with log_step("rag.total", session_id=session_id):
+        result = rag.get_result(query, history_string)
 
     add_message(session_id, ChatMessage(role="user", content=query.question))
     add_message(session_id, ChatMessage(role="assistant", content=result.content))
@@ -141,7 +167,8 @@ async def upload_file(
         session_id = get_session(query_request.session_id)
         history_string = get_history_str(session_id)
         
-        result = rag.get_result(query_request, history_string)
+        with log_step("rag.total", session_id=session_id):
+            result = rag.get_result(query_request, history_string)
         
         add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
         add_message(session_id, ChatMessage(role="assistant", content=result.content))

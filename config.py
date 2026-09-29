@@ -13,6 +13,7 @@ import os
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from observability import TokenUsageCallback
 
 load_dotenv()
 
@@ -35,6 +36,11 @@ TAVILY_MAX_RESULTS = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
 # Chroma 持久化目录：向量库数据落在这里，已在 .gitignore 中排除
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 
+# ---- 对话模型成本（可选，用于日志里的 cost_usd 估算）----
+# 未配置时为 0，此时只记录 token 数，不折算金额
+LLM_INPUT_PRICE_PER_MT = float(os.getenv("LLM_INPUT_PRICE_PER_MT", "0"))
+LLM_OUTPUT_PRICE_PER_MT = float(os.getenv("LLM_OUTPUT_PRICE_PER_MT", "0"))
+
 
 def get_chat_model(temperature: float = 0.1) -> ChatOpenAI:
     """对话模型实例。原先各文件各自 new 一个 ChatOpenAI，现在统一从这里取。"""
@@ -43,6 +49,12 @@ def get_chat_model(temperature: float = 0.1) -> ChatOpenAI:
         api_key=_env("OPENAI_API_KEY"),
         base_url=_env("OPENAI_BASE_URL"),
         temperature=temperature,
+        callbacks=[
+            TokenUsageCallback(
+                input_price_per_mtok=LLM_INPUT_PRICE_PER_MT,
+                output_price_per_mtok=LLM_OUTPUT_PRICE_PER_MT,
+            )
+        ],
     )
 
 
