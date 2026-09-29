@@ -45,6 +45,9 @@ HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 # Chroma 持久化目录：向量库数据落在这里，已在 .gitignore 中排除
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 
+# 会话库：SQLite 文件路径，同样已在 .gitignore 中排除
+SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "./sessions.db")
+
 # ---- 对话模型成本（可选，用于日志里的 cost_usd 估算）----
 # 未配置时为 0，此时只记录 token 数，不折算金额
 LLM_INPUT_PRICE_PER_MT = float(os.getenv("LLM_INPUT_PRICE_PER_MT", "0"))

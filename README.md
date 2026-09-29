@@ -13,7 +13,7 @@
 - **智能路由（Collection Router）**：由 LLM 判断问题应该落到哪个集合，支持多集合同时命中。
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%。
 - **自反思过滤（Self-Reflection）**：在生成答案前，先由 LLM 从知识库/网络结果中剔除无关信息。
-- **多轮对话**：后端按 `session_id` 维护会话，最多保留最近 20 条消息，生成时注入最近 4 条作为上下文。
+- **多轮对话**：后端按 `session_id` 维护会话，最多保留最近 20 条消息，生成时注入最近 4 条作为上下文；会话落盘在 SQLite，多 worker 共享、重启不丢。
 - **文件问答**：上传 `.docx`（zip + XML）后解析正文，结合用户问题一起回答。
 - **知识库动态写入**：可在前端直接录入「个人信息 / 音乐理解 / 歌单」三类私人数据。
 - **离线评测（llm_ev.py）**：内置 BLEU、ROUGE 与 LLM 忠诚度打分（0/1/2）脚本。
@@ -27,6 +27,7 @@
 | 后端框架 | FastAPI + Uvicorn |
 | LLM 编排 | LangChain（`langchain-openai`、`langchain-chroma`、`langchain-classic`、`langchain-community`） |
 | 向量数据库 | ChromaDB 1.4.0（本地持久化，无需独立服务或 Docker） |
+| 会话存储 | SQLite（标准库 `sqlite3`，WAL 模式，多进程共享同一个文件） |
 | 检索 | Chroma 稠密检索 + BM25 稀疏检索，经 `EnsembleRetriever` 加权融合，再由 Reranker（SiliconFlow `Qwen/Qwen3-Reranker-8B`）截取前 50% |
 | 联网搜索 | Tavily HTTP 接口（用 `httpx` 直调，带超时与 `tenacity` 重试） |
 | 分词/评测 | jieba、nltk（BLEU）、rouge-score |
@@ -38,18 +39,20 @@
 
 ```
 bishe/
-├── main.py                 # FastAPI 入口，路由、会话管理与文件上传
+├── main.py                 # FastAPI 入口，路由、文件上传（会话已外置到 session_store.py）
 ├── rag.py                  # RAG 主链路：查询重写、检索、自反思、答案生成
 ├── collection_router.py    # LLM 结构化输出做集合路由（含独立测试入口）
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
-├── config.py               # 模型 / 密钥 / Chroma 路径的统一配置入口
+├── config.py               # 模型 / 密钥 / Chroma 路径 / 会话库路径的统一配置入口
 ├── observability.py        # 结构化日志：JSON 格式、request_id、分步耗时、token 成本
+├── session_store.py        # 会话持久化：SQLite 建表、消息增删查、20 条裁剪
 ├── models/                 # 接口层与业务层共用的 Pydantic 数据结构
 ├── .env.example            # 环境变量模板（复制为 .env 后填写）
 ├── llm_ev.py               # 评测脚本：BLEU / ROUGE / LLM 忠诚度
 ├── self_data/              # 示例私人语料（自我介绍、音乐分析、歌单）
 ├── chroma_db/              # Chroma 持久化数据（运行时生成，不入库）
+├── sessions.db             # 会话库（运行时生成，不入库）
 └── music-chatbot-frontend/ # React 前端
     └── src/
         ├── App.js          # 聊天界面、会话管理、知识库录入、文件上传
@@ -105,8 +108,8 @@ bishe/
 
 ## 快速开始
 
-ChromaDB 以嵌入式方式运行，数据直接落盘到 `CHROMA_PERSIST_DIR`，
-**不需要 Docker，也不需要单独启动数据库服务**。
+ChromaDB 以嵌入式方式运行，数据直接落盘到 `CHROMA_PERSIST_DIR`；会话库是标准库 `sqlite3`
+写的单个文件 `sessions.db`。**两者都不需要 Docker，也不需要单独启动数据库服务**。
 
 ### 1. 后端依赖
 
@@ -131,6 +134,7 @@ cp .env.example .env    # 然后填写 .env
 需要填写的变量见 [.env.example](file:///d:/bishe/.env.example)：`OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 `LLM_MODEL` / `EMBEDDING_MODEL`（对话与向量模型，OpenAI 兼容接口）、`TAVILY_API_KEY`（联网搜索）、
 `RERANK_API_KEY`（重排序）、`CHROMA_PERSIST_DIR`（向量库落盘目录，默认 `./chroma_db`）、
+`SESSION_DB_PATH`（会话库文件路径，默认 `./sessions.db`）、
 `RERANK_TIMEOUT` / `WEB_SEARCH_TIMEOUT` / `HTTP_RETRIES`（外部调用的超时秒数与重试次数）。
 
 业务侧统一通过 `config.get_chat_model()`、`config.get_embeddings()` 取实例，
@@ -190,7 +194,7 @@ python llm_ev.py
 实现见 [observability.py](file:///d:/bishe/observability.py)。
 
 **公共字段**：`ts`、`level`、`logger`、`request_id`、`event`。
-`request_id` 由 [main.py](file:///d:/bishe/main.py#L35-L49) 的中间件按请求生成，存在 `contextvar` 里
+`request_id` 由 [main.py](file:///d:/bishe/main.py#L53-L67) 的中间件按请求生成，存在 `contextvar` 里
 贯穿整条调用链，业务函数无需层层传参，并回写到响应头 `X-Request-Id` 便于前端对齐。
 RAG 链路被下沉到线程池执行（见「注意事项」），`contextvar` 会随任务一起拷进工作线程，
 因此线程内产生的 `llm.usage`、`step.done` 仍带着同一个 `request_id`，也照常计入 `rag.total` 的合计。
@@ -242,13 +246,20 @@ for r in sorted(done, key=lambda x: -x.get('elapsed_ms', 0))[:10]:
 
 ## 注意事项
 
-- 会话数据存于内存字典 `sessions`，重启后丢失，且未做持久化与并发保护；`uvicorn --workers 2`
-  时每个 worker 各存一份，会话数据会错乱（`get_session` 里的 `len(sessions)` 后缀在不同进程
-  还会算出相同 id）。需要多 worker 时应换成 Redis 等外部存储。
+- 会话数据已外置到 SQLite（[session_store.py](file:///d:/bishe/session_store.py)，库文件 `SESSION_DB_PATH`）：
+  所有 worker 读写同一个文件，`uvicorn --workers 2` 不再各存一份，进程重启也不丢。
+  建表与切换 WAL 由 [main.py](file:///d:/bishe/main.py#L31-L35) 的 `lifespan` 在启动时执行，幂等。
+  并发写靠 WAL（读写可并存）+ `busy_timeout`（写冲突时等待而不是报 `database is locked`）兜住。
+  连接按线程复用，避免每次开关连接都触发 WAL checkpoint 并删 `-wal`/`-shm`（Windows 上约 35ms/次），
+  复用后单次读写约 0.4ms，因此没有再把会话读写下沉到线程池。
+- 会话 id 改为「时间戳 + 随机后缀」（原先用 `len(sessions)` 当后缀，多 worker 下会算出相同 id）。
+  传入一个库里不存在的 `session_id` 会新建会话而不是报错——与原实现语义一致。
+- 单个会话只保留最近 20 条消息；`DELETE` 清空历史只删消息、保留会话本身，因此清空后再查历史返回
+  200 + 空列表，只有从未存在的 `session_id` 才返回 404。
 - 耗时的业务函数都是同步实现（LLM、`requests`、Chroma 都没有异步 API），直接在 `async def`
   端点里调用会占住事件循环，同一 worker 上的请求只能排队。现已用 `run_in_threadpool` 下沉到
-  线程池：RAG 链路在 [chat](file:///d:/bishe/main.py#L97-L101) / [upload](file:///d:/bishe/main.py#L174-L175)，
-  知识库写入在 [三个 knowledge 端点](file:///d:/bishe/main.py#L193-L215)
+  线程池：RAG 链路在 [chat](file:///d:/bishe/main.py#L79-L80) / [upload](file:///d:/bishe/main.py#L152-L153)，
+  知识库写入在 [三个 knowledge 端点](file:///d:/bishe/main.py#L171-L193)
   （`chunk_document` 与 `add_documents` 内部要调 Embedding，语料大时是秒级）。
   线程上限由 anyio 默认的 40 控制，超出后新请求会排队等待空闲线程。
 - 外部调用统一走 `rag._post_json`，都带超时并做指数退避重试：只对超时、网络错误、5xx、429 重试，

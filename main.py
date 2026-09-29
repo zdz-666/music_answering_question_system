@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from typing import Optional
 from datetime import datetime
+from contextlib import asynccontextmanager
 from models import QueryRequest, ChatMessage, ChatResponse, ChatHistoryResponse
 from observability import (
     new_request_id,
@@ -14,14 +15,30 @@ from observability import (
     log_step,
     logger,
 )
+from session_store import (
+    add_message,
+    clear_messages,
+    get_history_str,
+    get_or_create_session,
+    init_db,
+    list_messages,
+)
 import zipfile
 import io
 import re
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 会话库建表并切到 WAL。每个 worker 启动时各跑一次，幂等。
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="Chatbot API",
-    description="基于Langchain的智能问答系统API"
+    description="基于Langchain的智能问答系统API",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -49,49 +66,11 @@ async def request_logging(request, call_next):
     finally:
         reset_request_id(token)
 
-sessions = {}
-
-"""
-sessions{str : {"created_at": str, "messages": List[ChatMessage]}}
-"""
-#获取或创建对话
-def get_session(session_id: str):
-    if session_id and session_id in sessions:
-        return session_id
-    new_session_id = f"session_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(sessions)}"
-    sessions[new_session_id] = {
-        "created_at": datetime.now().isoformat(),
-        "messages": []
-    }
-    return new_session_id
-
-#添加消息到会话
-def add_message(session_id: str, message: ChatMessage):
-    if session_id in sessions:
-        message = ChatMessage(
-            role=message.role,
-            content=message.content,
-            timestamp=datetime.now().isoformat()
-        )
-        sessions[session_id]["messages"].append(message)
-
-        # 限制历史消息为20条
-        if len(sessions[session_id]["messages"]) > 20:
-            sessions[session_id]["messages"] = sessions[session_id]["messages"][-20:]
-
-def get_history_str(session_id: str):
-    messages = sessions[session_id]["messages"][-4:]
-    history_string = ""
-    for msg in messages:
-        if msg.role == "user":
-            history_string += f"用户: {msg.content}\n"
-        elif msg.role == "assistant":
-            history_string += f"助手: {msg.content}\n"
-    return history_string
+# 会话存储已外置到 SQLite（session_store.py）：跨 worker 共享、进程重启不丢。
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(query: QueryRequest):
 
-    session_id = get_session(query.session_id)
+    session_id = get_or_create_session(query.session_id)
     history_string = get_history_str(session_id)
 
     # rag.get_result 是同步阻塞函数（内部是同步 LLM / requests / Chroma 调用），
@@ -113,10 +92,10 @@ async def chat(query: QueryRequest):
 
 @app.get("/api/chat/history/{session_id}", response_model=ChatHistoryResponse)
 async def get_history(session_id: str, number: int = Query(20, ge=1, le = 100)):
-    if session_id not in sessions:
+    messages = list_messages(session_id, number)
+    if messages is None:
         raise HTTPException(status_code=404, detail="对话不存在")
-    
-    messages = sessions[session_id]["messages"][-number:]
+
     response = ChatHistoryResponse(
         session_id=session_id,
         messages=messages,
@@ -128,10 +107,9 @@ async def get_history(session_id: str, number: int = Query(20, ge=1, le = 100)):
 
 @app.delete("/api/chat/history/{session_id}")
 async def delete_history(session_id: str):
-    if session_id not in sessions:
+    if not clear_messages(session_id):
         raise HTTPException(status_code=404, detail="对话不存在")
-    
-    sessions[session_id]["messages"] = []
+
     return {"message": "对话历史已删除",
             "session_id": session_id}
 
@@ -168,7 +146,7 @@ async def upload_file(
             file_content=file_content
         )
         
-        session_id = get_session(query_request.session_id)
+        session_id = get_or_create_session(query_request.session_id)
         history_string = get_history_str(session_id)
         
         with log_step("rag.total", session_id=session_id):

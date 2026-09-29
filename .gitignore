@@ -1,6 +1,9 @@
 # Chroma 向量库数据（本地运行时生成，勿提交）
 chroma_db/
 
+# 会话库（本地运行时生成，含 -wal / -shm 副本）
+sessions.db*
+
 # Python
 __pycache__/
 *.py[cod]
