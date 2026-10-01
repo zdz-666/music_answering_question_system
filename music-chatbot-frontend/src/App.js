@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { chatAPI } from './service/api.js';
 import './App.css';
 
@@ -399,7 +401,18 @@ function App() {
                         </span>
                       )}
                     </div>
-                    <div className="message-text">{message.content}</div>
+                    {/* 助手回复按 Markdown 渲染，用户自己的输入保持纯文本原样显示 */}
+                    <div className="message-text">
+                      {message.role === 'user' ? (
+                        message.content
+                      ) : (
+                        <div className="markdown">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {message.content}
+                          </ReactMarkdown>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               ))

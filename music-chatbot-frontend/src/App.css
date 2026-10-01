@@ -483,6 +483,139 @@ body {
   border-bottom-left-radius: 3px;
 }
 
+/* 助手回复的 Markdown 内容：间距改由块级元素控制，覆盖父级的 pre-wrap */
+.markdown {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown pre,
+.markdown table {
+  margin: 0 0 0.7em;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 1em 0 0.45em;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.markdown h1 {
+  font-size: 1.12rem;
+}
+
+.markdown h2 {
+  font-size: 1.04rem;
+}
+
+.markdown h3 {
+  font-size: 0.975rem;
+}
+
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  font-size: 0.925rem;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 1.35em;
+}
+
+.markdown li {
+  margin-bottom: 0.2em;
+}
+
+.markdown li > p {
+  margin-bottom: 0.3em;
+}
+
+.markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown strong {
+  font-weight: 650;
+}
+
+.markdown code {
+  padding: 0.1em 0.35em;
+  background: rgba(23, 32, 31, 0.06);
+  border-radius: 4px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.88em;
+}
+
+.markdown pre {
+  padding: 0.7rem 0.85rem;
+  background: #17201f;
+  color: #e7eae9;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+
+.markdown pre code {
+  padding: 0;
+  background: none;
+  color: inherit;
+  font-size: 0.85em;
+}
+
+.markdown blockquote {
+  padding: 0.15em 0 0.15em 0.85em;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875em;
+}
+
+.markdown th,
+.markdown td {
+  padding: 0.4em 0.65em;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.markdown th {
+  background: var(--surface);
+  font-weight: 600;
+}
+
+.markdown hr {
+  margin: 0.9em 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+.markdown img {
+  max-width: 100%;
+  height: auto;
+}
+
 /* 输入区域 */
 .input-container {
   flex-shrink: 0;
