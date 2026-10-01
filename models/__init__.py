@@ -11,8 +11,7 @@ from pydantic import BaseModel
 class QueryRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
-    use_web_search: bool = True
-    use_knowledge_base: bool = True
+    # 是否走知识库 / 网络检索由 retrieval_planner 依据提问自动决定，不再由调用方指定
     file_content: Optional[str] = None
 
 

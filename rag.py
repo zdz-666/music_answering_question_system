@@ -5,6 +5,7 @@ from dynamic_chunk import SemanticChunker
 from data_storage import vector_similarity_search, load_vector_store
 from config import (
     HTTP_RETRIES,
+    MAX_SUPPLEMENT_ROUNDS,
     RERANK_BASE_URL,
     RERANK_MODEL,
     RERANK_TIMEOUT,
@@ -16,6 +17,7 @@ from config import (
     get_tavily_api_key,
 )
 from observability import log_step, logger
+from retrieval_planner import judge_retrieval_sufficiency, plan_retrieval_channels
 import httpx
 import math
 from tenacity import (
@@ -105,8 +107,9 @@ def query_rewriting(query: str):
 """
     rewriting_query = ChatPromptTemplate.from_template(prompt)
     messages = rewriting_query.format_messages(question=query)
-    with log_step("query_rewriting", query_len=len(query)):
+    with log_step("query_rewriting", input=query, query_len=len(query)) as span:
         result = llm.invoke(messages)
+        span.output = result.content
     return result.content
 
 
@@ -146,13 +149,25 @@ def web_rewriting(query: str):
 """
     rewriting_query = ChatPromptTemplate.from_template(prompt)
     messages = rewriting_query.format_messages(question=query)
-    with log_step("web_rewriting", query_len=len(query)):
+    with log_step("web_rewriting", input=query, query_len=len(query)) as span:
         result = llm.invoke(messages)
+        span.output = result.content
     return result.content
 
 
-def web_search(query: str):
-    with log_step("web_search", provider="tavily", max_results=TAVILY_MAX_RESULTS):
+def web_search(query: str) -> list:
+    """Tavily 联网搜索，返回最多 TAVILY_MAX_RESULTS 条结果（list[dict]）。
+
+    原先只取 results[0]，请求已经带回来的其余结果被丢掉，且命中空列表时
+    会抛 IndexError。现在取回全部结果并做类型过滤，空结果退化为空列表 +
+    一条警告，由下游的格式化函数渲染成“无网络检索结果”。
+    """
+    with log_step(
+        "web_search",
+        input=query,
+        provider="tavily",
+        max_results=TAVILY_MAX_RESULTS,
+    ) as span:
         # 直接调 Tavily 的 HTTP 接口，省掉 SDK，超时与重试统一由 _post_json 兜住
         response = _post_json(
             TAVILY_API_URL,
@@ -163,7 +178,13 @@ def web_search(query: str):
             },
             timeout=WEB_SEARCH_TIMEOUT,
         )
-    return response.get("results")[0]
+        results = [
+            item for item in (response.get("results") or []) if isinstance(item, dict)
+        ][:TAVILY_MAX_RESULTS]
+        if not results:
+            logger.warning("web_search.empty", extra={"fields": {"query": query}})
+        span.output = results
+    return results
 
 def get_web_search(query):
         query_change = web_rewriting(query)
@@ -173,8 +194,6 @@ def get_web_search(query):
 def rerank(documents, query):
     documents = [doc.page_content for doc in documents]
     l = len(documents)
-    if l == 0:
-        return []
 
     num_to_extract = math.ceil(l * 0.5)
     headers = {
@@ -186,32 +205,47 @@ def rerank(documents, query):
     "query": query,
     "documents": documents
 }
-    with log_step("rerank", model=RERANK_MODEL, docs_in=l, docs_keep=num_to_extract):
-        try:
-            text = _post_json(
-                RERANK_BASE_URL, payload, headers, timeout=RERANK_TIMEOUT
-            )
-        except Exception as exc:
-            # 重排只是让排序更准的增强步骤，上游挂掉不该把整条问答打成 500。
-            # 退化为混合检索的原顺序（EnsembleRetriever 的 RRF 排序）截断。
-            return _degrade_rerank(documents, num_to_extract, exc)
+    with log_step(
+        "rerank",
+        input={"query": query, "documents": documents},
+        model=RERANK_MODEL,
+        docs_in=l,
+        docs_keep=num_to_extract,
+    ) as span:
+        # 检索没命中任何文档时（集合为空、或改写后的查询没召回）不做请求，
+        # 但这一步仍然进追踪，否则链路里会凭空少一环。
+        result = []
+        if l:
+            try:
+                text = _post_json(
+                    RERANK_BASE_URL, payload, headers, timeout=RERANK_TIMEOUT
+                )
+            except Exception as exc:
+                # 重排只是让排序更准的增强步骤，上游挂掉不该把整条问答打成 500。
+                # 退化为混合检索的原顺序（EnsembleRetriever 的 RRF 排序）截断。
+                result = _degrade_rerank(documents, num_to_extract, exc)
+            else:
+                results = text.get("results") or []
 
-    results = text.get("results") or []
+                for i, item in enumerate(results):
+                    if i >= num_to_extract:
+                        break
+                    idx = item.get("index")
 
-    docs = []
-    for i, result in enumerate(results):
-        if i >= num_to_extract:
-            break
-        idx = result.get("index")
+                    if isinstance(idx, int) and 0 <= idx < l:
+                        result.append(documents[idx])
 
-        if isinstance(idx, int) and 0 <= idx < l:
-            docs.append(documents[idx])
+                if not result:
+                    # 返回了 200 但结构对不上（网关错误页、字段改名等），同样退化为原序
+                    result = _degrade_rerank(
+                        documents,
+                        num_to_extract,
+                        f"响应中没有可用的 index（results={len(results)}）",
+                    )
 
-    if not docs:
-        # 返回了 200 但结构对不上（网关错误页、字段改名等），同样退化为原序
-        return _degrade_rerank(documents, num_to_extract, f"响应中没有可用的 index（results={len(results)}）")
+        span.output = result
 
-    return docs
+    return result
 
 
 def _degrade_rerank(documents, num_to_extract, reason):
@@ -229,32 +263,209 @@ def _degrade_rerank(documents, num_to_extract, reason):
     return documents[:num_to_extract]
 
 
-def get_vector_search(query):
-    with log_step("collection_router"):
-        collection_list = get_router_collection(query)
+def route_collections(question: str) -> list:
+    """由 LLM 判断这个问题该落到哪几个集合。
 
+    与检索拆开是因为补充检索要复用首轮的集合名，不能每轮重跑一次路由。
+    """
+    with log_step("collection_router", input=question) as span:
+        collection_list = get_router_collection(question)
+        span.output = collection_list
+    return collection_list
+
+
+def get_vector_search(query, collection_list) -> list:
+    """在给定集合列表上做混合检索 + 重排，返回重排后的 chunk 列表。
+
+    返回 list[str]（而不是拼好的大字符串）是为了让多轮检索结果能按 chunk 粒度去重。
+    """
     result = []
     query_change = query_rewriting(query)
     for co_name in collection_list:
-        with log_step("vector_search", collection=co_name, k=6):
+        with log_step(
+            "vector_search", input=query_change, collection=co_name, k=6
+        ) as span:
             vector_result = vector_similarity_search(co_name, query_change, k=6)
+            # Document 对象直接进日志会是 <Document ...> 这样的 repr，这里只取正文
+            span.output = [doc.page_content for doc in vector_result]
 
-        result_list = rerank(vector_result, query_change)
+        result.extend(rerank(vector_result, query_change))
 
-        combined_content = ""
-        for i, doc in enumerate(result_list):
-            if i > 0:
-                combined_content += "\n"
-            combined_content += doc
-        result.append(combined_content)
+    return result
 
-    vector_result = ""
-    for i, context in enumerate(result):
-        if i > 0:
-            vector_result += "\n"
-        vector_result += context
 
-    return vector_result
+def format_kb_chunks(chunks: list) -> str:
+    """知识库 chunk 列表 → 交给 prompt 的字符串。
+
+    结果只作为模板变量传入 ChatPromptTemplate，绝不拼进模板本身——
+    语料里的 `{}`（上传的 XML、歌词）否则会被当成占位符解析。
+    """
+    if not chunks:
+        return "无知识库检索结果"
+    return "\n".join(chunks)
+
+
+def format_web_items(items: list) -> str:
+    """Tavily 条目列表 → 带序号的文本块，供 self_reflection 的 {web_result} 使用。"""
+    if not items:
+        return "无网络检索结果"
+    blocks = []
+    for i, item in enumerate(items, 1):
+        title = (item.get("title") or "无标题").strip()
+        url = (item.get("url") or "").strip()
+        content = (item.get("content") or "").strip()
+        blocks.append(f"[{i}] {title}\nURL：{url}\n内容：{content}")
+    return "\n\n".join(blocks)
+
+
+def _normalize_query(text: str) -> str:
+    """折叠空白并小写，用于比较两条检索语句/两段文本是否重复。"""
+    return " ".join((text or "").split()).lower()
+
+
+def merge_kb_chunks(existing: list, new: list) -> list:
+    """把新一轮的 chunk 追加到已有结果后，按规范化文本精确去重（保留首次出现顺序）。"""
+    merged = list(existing)
+    seen = {_normalize_query(chunk) for chunk in existing}
+    for chunk in new:
+        key = _normalize_query(chunk)
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(chunk)
+    return merged
+
+
+def _web_key(item: dict) -> str:
+    """网络条目的去重键：优先 URL，退回标题，再退回内容前 120 字。"""
+    if item.get("url"):
+        return item["url"].strip().lower()
+    text = item.get("title") or item.get("content") or ""
+    return _normalize_query(text)[:120]
+
+
+def merge_web_items(existing: list, new: list) -> list:
+    """把新一轮的网络结果追加到已有结果后，按 URL/标题精确去重。"""
+    merged = list(existing)
+    seen = {_web_key(item) for item in existing}
+    for item in new:
+        key = _web_key(item)
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def _channel_label(uses_kb: bool, uses_web: bool) -> str:
+    if uses_kb and uses_web:
+        return "knowledge_base+web_search"
+    return "knowledge_base" if uses_kb else "web_search"
+
+
+def _supplement_retrieval(question, uses_kb, uses_web, collection_list, kb_chunks, web_items):
+    """信息不足时用新语句再检索，最多 MAX_SUPPLEMENT_ROUNDS 轮。
+
+    通道沿用首轮决策，集合名沿用首轮结果。任何异常都只终止补检索、
+    保留已有结果继续往下走（上游抖动不该把整条问答打成 500）。
+    """
+    seen_queries = {_normalize_query(question)}
+    for round_index in range(1, MAX_SUPPLEMENT_ROUNDS + 1):
+        try:
+            assessment = judge_retrieval_sufficiency(
+                question=question,
+                kb_text=format_kb_chunks(kb_chunks),
+                web_text=format_web_items(web_items),
+                channel=_channel_label(uses_kb, uses_web),
+                round_index=round_index,
+            )
+        except Exception as exc:
+            logger.warning(
+                "supplement.assess_failed",
+                extra={
+                    "fields": {
+                        "round": round_index,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                    }
+                },
+            )
+            break
+
+        if assessment.is_sufficient:
+            break
+
+        new_query = (assessment.new_query or "").strip()
+        new_key = _normalize_query(new_query)
+        if not new_key or new_key in seen_queries:
+            # 语句为空或与已用过的重复：没有有效进展，再查也是白花一次调用
+            break
+        seen_queries.add(new_key)
+
+        try:
+            if uses_kb:
+                kb_chunks = merge_kb_chunks(
+                    kb_chunks, get_vector_search(new_query, collection_list)
+                )
+            if uses_web:
+                web_items = merge_web_items(web_items, get_web_search(new_query))
+        except Exception as exc:
+            logger.warning(
+                "supplement.retrieve_failed",
+                extra={
+                    "fields": {
+                        "round": round_index,
+                        "query": new_query,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                    }
+                },
+            )
+            break
+
+    return kb_chunks, web_items
+
+
+def _retrieve_and_reflect(question: str) -> str:
+    """通道规划 → 首轮检索 → 补充检索 → 自反思，返回可直接作为 {context} 的字符串。
+
+    通道规划必须放在最前面：它决定 collection_router / web_rewriting 要不要跑，
+    放晚了关掉的通道会被白跑一遍。
+    """
+    plan = plan_retrieval_channels(question)
+
+    if not plan.use_knowledge_base and not plan.use_web_search:
+        # 模型判定无需检索：跳过检索与自反思，让生成步骤凭自身知识作答
+        return "本次提问无需检索，请基于你自身的音乐知识作答。"
+
+    collection_list = []
+    kb_chunks = []
+    web_items = []
+    if plan.use_knowledge_base:
+        collection_list = route_collections(question)
+        kb_chunks = get_vector_search(question, collection_list)
+    if plan.use_web_search:
+        web_items = get_web_search(question)
+
+    kb_chunks, web_items = _supplement_retrieval(
+        question,
+        plan.use_knowledge_base,
+        plan.use_web_search,
+        collection_list,
+        kb_chunks,
+        web_items,
+    )
+
+    return self_reflection(
+        question, format_kb_chunks(kb_chunks), format_web_items(web_items)
+    )
+
+
+def _generate(prompt_template: str, variables: dict, **step_fields):
+    """格式化 prompt → 调 LLM → 写 span，返回 AIMessage（保持 get_result 的既有契约）。"""
+    messages = ChatPromptTemplate.from_template(prompt_template).format_messages(**variables)
+
+    llm = get_chat_model()
+    with log_step("generate", input=variables, **step_fields) as span:
+        result = llm.invoke(messages)
+        span.output = result.content
+    return result
 
 def self_reflection(query, vector_result, web_result):
     llm = get_chat_model()
@@ -270,26 +481,25 @@ def self_reflection(query, vector_result, web_result):
 """
     prompt = ChatPromptTemplate.from_template(prompt_template)
     messages = prompt.format_messages(query=query, vector_result=vector_result, web_result=web_result)
-    with log_step("self_reflection", has_vector=bool(vector_result), has_web=bool(web_result)):
+    with log_step(
+        "self_reflection",
+        input={
+            "query": query,
+            "vector_result": vector_result,
+            "web_result": web_result,
+        },
+        has_vector=bool(vector_result),
+        has_web=bool(web_result),
+    ) as span:
         result = llm.invoke(messages)
+        span.output = result.content
     logger.info("self_reflection.result", extra={"fields": {"content": result.content}})
     return result.content
 
 def get_result(query: QueryRequest, history_string: str):
-     web_search_result = None
-     vector_search_result = None
-
-     if query.use_web_search:
-        web_search_result = get_web_search(query.question)
-     else:
-        web_search_result = "未使用网络搜索"
-
-     if query.use_knowledge_base:
-        vector_search_result = get_vector_search(query.question)
-     else:
-        vector_search_result = "未使用知识库"
-
-     context = self_reflection(query.question, vector_search_result, web_search_result)
+     # 检索通道（知识库 / 网络）改由 retrieval_planner 依据提问自动决定，
+     # 不再读 query 上的开关字段。
+     context = _retrieve_and_reflect(query.question)
 
      prompt_template = """
         你是一个专业的音乐知识问答助手，名为“乐典”。你的核心职责是准确、专业、清晰地回答用户关于音乐的一切问题。
@@ -305,16 +515,16 @@ def get_result(query: QueryRequest, history_string: str):
         用户上传的文件内容是：{file_content}
         与用户提问相关的信息是：{context}
         """
-     prompt = ChatPromptTemplate.from_template(prompt_template)
-     messages = prompt.format_messages(history_string=history_string,
-                                       question=query.question, 
-                                       file_content=query.file_content,
-                                       context=context)
-    
-     llm = get_chat_model()
-     with log_step("generate", has_file=bool(query.file_content)):
-         result = llm.invoke(messages)
-     return result
+     return _generate(
+         prompt_template,
+         {
+             "question": query.question,
+             "history_string": history_string,
+             "file_content": query.file_content,
+             "context": context,
+         },
+         has_file=bool(query.file_content),
+     )
 
 def add_self_introduction(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
@@ -331,21 +541,10 @@ def add_music_list(text: str):
     vector_store = load_vector_store("music_list")
     vector_store.add_documents(docs)
 
-def get_result_evaluate(query: str,use_web_search: bool, use_knowledge_base: bool):
-     web_search_result = None
-     vector_search_result = None
-
-     if use_web_search:
-        web_search_result = get_web_search(query)
-     else:
-        web_search_result = "未使用网络搜索"
-
-     if use_knowledge_base:
-        vector_search_result = get_vector_search(query)
-     else:
-        vector_search_result = "未使用知识库"
-
-     context = self_reflection(query, vector_search_result, web_search_result)
+def get_result_evaluate(query: str):
+     # 与 get_result 共用同一条「通道规划 → 检索 → 补充检索 → 自反思」链路，
+     # 只有生成用的 prompt 不同（评测场景不带历史与上传文件）。
+     context = _retrieve_and_reflect(query)
 
      prompt_template = """
         你是一个专业的音乐知识问答助手，名为“乐典”。你的核心职责是准确、专业、清晰地回答用户关于音乐的一切问题。
@@ -360,12 +559,9 @@ def get_result_evaluate(query: str,use_web_search: bool, use_knowledge_base: boo
 
         与用户提问相关的信息是：{context}
         """
-     prompt = ChatPromptTemplate.from_template(prompt_template)
-     messages = prompt.format_messages(
-                                       question=query, 
-                                       context=context)
-    
-     llm = get_chat_model()
-     with log_step("generate"):
-         result = llm.invoke(messages)
+     result = _generate(
+         prompt_template,
+         {"question": query, "context": context},
+         step_variant="evaluate",
+     )
      return context, result.content

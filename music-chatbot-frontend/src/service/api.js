@@ -11,13 +11,12 @@ const api = axios.create({
 // API 调用函数
 export const chatAPI = {
   // 发送消息
-  async sendMessage({ question, sessionId, useWebSearch = true, useKnowledgeBase = true }) {
+  // 是否走知识库/网络检索由后端模型依据提问决定，前端不再传开关
+  async sendMessage({ question, sessionId }) {
     try {
       const response = await api.post('/api/chat', {
         question,
         session_id: sessionId,
-        use_web_search: useWebSearch,
-        use_knowledge_base: useKnowledgeBase,
       });
       return response.data;
     } catch (error) {

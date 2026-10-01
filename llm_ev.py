@@ -78,11 +78,7 @@ def llm_evaluator(query: str, reference_text: str, generated_answer: str):
     return response.content
 
 def rag_process(query: str):
-    context, result_content = rag.get_result_evaluate(
-        query=query,
-        use_web_search=True,
-        use_knowledge_base=True,
-    )
+    context, result_content = rag.get_result_evaluate(query=query)
     result = llm_evaluator(
         query=query,
         reference_text=context,

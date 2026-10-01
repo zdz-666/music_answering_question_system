@@ -76,8 +76,9 @@ async def chat(query: QueryRequest):
     # rag.get_result 是同步阻塞函数（内部是同步 LLM / requests / Chroma 调用），
     # 直接在 async 端点里调用会占住事件循环，同一 worker 上的其它请求全部排队。
     # 下沉到线程池后本进程才能并发处理请求；request_id 与 token 计量靠 contextvars 传递。
-    with log_step("rag.total", session_id=session_id):
+    with log_step("rag.total", input=query.question, session_id=session_id) as span:
         result = await run_in_threadpool(rag.get_result, query, history_string)
+        span.output = result.content
 
     add_message(session_id, ChatMessage(role="user", content=query.question))
     add_message(session_id, ChatMessage(role="assistant", content=result.content))
@@ -118,8 +119,6 @@ async def upload_file(
     file: UploadFile = File(...),
     question: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
-    use_web_search: bool = Form(True),
-    use_knowledge_base: bool = Form(True)
 ):
     try:
         content = await file.read()
@@ -141,16 +140,19 @@ async def upload_file(
         query_request = QueryRequest(
             question=question or "请分析上传的文件",
             session_id=session_id,
-            use_web_search=use_web_search,
-            use_knowledge_base=use_knowledge_base,
             file_content=file_content
         )
         
         session_id = get_or_create_session(query_request.session_id)
         history_string = get_history_str(session_id)
         
-        with log_step("rag.total", session_id=session_id):
+        with log_step(
+            "rag.total",
+            input={"question": query_request.question, "file": file.filename},
+            session_id=session_id,
+        ) as span:
             result = await run_in_threadpool(rag.get_result, query_request, history_string)
+            span.output = result.content
         
         add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
         add_message(session_id, ChatMessage(role="assistant", content=result.content))

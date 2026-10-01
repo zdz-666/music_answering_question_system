@@ -13,12 +13,10 @@ function App() {
   const [selfIntroduction, setSelfIntroduction] = useState('');
   const [musicAnalysis, setMusicAnalysis] = useState('');
   const [musicList, setMusicList] = useState('');
-  const [settings, setSettings] = useState({
-    useWebSearch: true,
-    useKnowledgeBase: true,
-  });
+  const [showKnowledge, setShowKnowledge] = useState(false);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const inputRef = useRef(null);
 
   // 自动滚动到底部
   const scrollToBottom = () => {
@@ -28,12 +26,6 @@ function App() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
-
-  // 生成新的会话ID
-  const generateNewSessionId = () => {
-    // 不再在前端生成session_id，由后端统一生成
-    return null;
-  };
 
   // 处理发送消息
   const handleSendMessage = async () => {
@@ -55,8 +47,6 @@ function App() {
       const response = await chatAPI.sendMessage({
         question: inputText,
         sessionId: sessionId, // 直接使用当前的sessionId，如果为null则由后端生成
-        useWebSearch: settings.useWebSearch,
-        useKnowledgeBase: settings.useKnowledgeBase,
       });
 
       // 更新会话ID（后端会返回正确的session_id）
@@ -239,8 +229,11 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>🎵 乐典音乐助手</h1>
-        <p className="subtitle">-------励志于打造专业的音乐知识问答系统-------</p>
+        <h1>
+          <span className="brand-mark" aria-hidden="true">♪</span>
+          乐典音乐助手
+        </h1>
+        <p className="subtitle">专注音乐领域的知识问答系统</p>
       </header>
 
       <div className="main-container">
@@ -281,39 +274,24 @@ function App() {
               <p className="session-hint">修改会话ID可切换到不同对话</p>
             </div>
 
-            <div className="settings-section">
-              <h4>设置</h4>
-              <div className="setting-item">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={settings.useWebSearch}
-                    onChange={(e) => setSettings(prev => ({
-                      ...prev,
-                      useWebSearch: e.target.checked
-                    }))}
-                  />
-                  使用网络搜索
-                </label>
-              </div>
-              <div className="setting-item">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={settings.useKnowledgeBase}
-                    onChange={(e) => setSettings(prev => ({
-                      ...prev,
-                      useKnowledgeBase: e.target.checked
-                    }))}
-                  />
-                  使用知识库
-                </label>
-              </div>
-            </div>
-
             <div className="knowledge-section">
-              <h4>知识库管理</h4>
-              
+              <button
+                type="button"
+                className="section-toggle"
+                onClick={() => setShowKnowledge(prev => !prev)}
+                aria-expanded={showKnowledge}
+                aria-controls="knowledge-panel"
+              >
+                <span>知识库管理</span>
+                <span className="toggle-chevron" aria-hidden="true">▾</span>
+              </button>
+
+              {showKnowledge && (
+              <div className="knowledge-panel" id="knowledge-panel">
+              <p className="section-hint">
+                添加的内容会写入知识库，供助手在回答时检索。
+              </p>
+
               <div className="knowledge-item">
                 <h5>个人信息</h5>
                 <textarea
@@ -364,6 +342,8 @@ function App() {
                   添加
                 </button>
               </div>
+              </div>
+              )}
             </div>
           </div>
         </aside>
@@ -378,11 +358,25 @@ function App() {
                 <h3>欢迎使用乐典音乐助手！</h3>
                 <p>我是一个专业的音乐知识问答助手，可以回答你关于音乐的各种问题。</p>
                 <p>例如：</p>
-                <ul className="example-questions">
-                  <li>贝多芬的第五交响曲有什么特点？</li>
-                  <li>什么是蓝调音乐？</li>
-                  <li>推荐一些古典音乐作品</li>
-                </ul>
+                <div className="example-questions">
+                  {[
+                    '贝多芬的第五交响曲有什么特点？',
+                    '什么是蓝调音乐？',
+                    '推荐一些古典音乐作品',
+                  ].map((question) => (
+                    <button
+                      key={question}
+                      type="button"
+                      className="example-question"
+                      onClick={() => {
+                        setInputText(question);
+                        inputRef.current?.focus();
+                      }}
+                    >
+                      {question}
+                    </button>
+                  ))}
+                </div>
               </div>
             ) : (
               messages.map((message, index) => (
@@ -390,8 +384,8 @@ function App() {
                   key={index}
                   className={`message ${message.role === 'user' ? 'user-message' : 'ai-message'}`}
                 >
-                  <div className="message-avatar">
-                    {message.role === 'user' ? '👤' : '🤖'}
+                  <div className="message-avatar" aria-hidden="true">
+                    {message.role === 'user' ? '你' : '乐'}
                   </div>
                   <div className="message-content">
                     <div className="message-role">
@@ -412,7 +406,7 @@ function App() {
             )}
             {loading && (
               <div className="message ai-message">
-                <div className="message-avatar">🤖</div>
+                <div className="message-avatar" aria-hidden="true">乐</div>
                 <div className="message-content">
                   <div className="message-role">乐典助手</div>
                   <div className="message-text typing-indicator">
@@ -474,6 +468,7 @@ function App() {
                 </button>
               </div>
               <textarea
+                ref={inputRef}
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 onKeyPress={handleKeyPress}
@@ -495,8 +490,7 @@ function App() {
               </button>
             </div>
             <div className="input-hint">
-              当前设置: {settings.useWebSearch ? '网络搜索✅' : '网络搜索❌'} | 
-              {settings.useKnowledgeBase ? '知识库✅' : '知识库❌'}
+              检索方式由助手依据提问自动决定（知识库 / 网络搜索 / 两者）
             </div>
           </div>
         </main>

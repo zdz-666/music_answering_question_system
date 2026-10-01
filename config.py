@@ -42,6 +42,10 @@ WEB_SEARCH_TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "10"))
 # 重试次数（不含首次），即最多尝试 HTTP_RETRIES + 1 次
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 
+# ---- 检索策略 ----
+# 首轮检索之后最多追加几轮补充检索（硬上限，防止无限循环）；0 表示关闭补充检索
+MAX_SUPPLEMENT_ROUNDS = int(os.getenv("MAX_SUPPLEMENT_ROUNDS", "2"))
+
 # Chroma 持久化目录：向量库数据落在这里，已在 .gitignore 中排除
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 
