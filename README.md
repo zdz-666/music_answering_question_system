@@ -15,7 +15,8 @@
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%。
 - **自反思过滤（Self-Reflection）**：在生成答案前，先由 LLM 从知识库/网络结果中剔除无关信息。
 - **多轮对话**：后端按 `session_id` 维护会话，最多保留最近 20 条消息，生成时注入最近 4 条作为上下文；会话落盘在 SQLite，多 worker 共享、重启不丢。
-- **文件问答**：上传 `.docx`（zip + XML）后解析正文，结合用户问题一起回答。
+- **文件问答**：上传 `.pdf` / `.docx`，同时解析正文与内嵌图片——图片由视觉模型（VLM）
+  转成中文描述后一起参与问答，扫描页（无文字层）自动整页渲染识别。
 - **知识库动态写入**：可在前端直接录入「个人信息 / 音乐理解 / 歌单」三类私人数据。
 - **离线评测（llm_ev.py）**：内置 BLEU、ROUGE 与 LLM 忠诚度打分（0/1/2）脚本。
 
@@ -31,6 +32,7 @@
 | 会话存储 | SQLite（标准库 `sqlite3`，WAL 模式，多进程共享同一个文件） |
 | 检索 | Chroma 稠密检索 + BM25 稀疏检索，经 `EnsembleRetriever` 加权融合，再由 Reranker（SiliconFlow `Qwen/Qwen3-Reranker-8B`）截取前 50% |
 | 联网搜索 | Tavily HTTP 接口（用 `httpx` 直调，带超时与 `tenacity` 重试） |
+| 文档解析 | PyMuPDF（PDF 文字 / 内嵌图 / 扫描页）、python-docx + zip（DOCX 正文与图片）、Pillow（图片尺寸） |
 | 分词/评测 | jieba、nltk（BLEU）、rouge-score |
 | 前端 | React 19 + Create React App + axios |
 
@@ -44,6 +46,7 @@ bishe/
 ├── rag.py                  # RAG 主链路：查询重写、检索、自反思、答案生成
 ├── collection_router.py    # LLM 结构化输出做集合路由（含独立测试入口）
 ├── retrieval_planner.py    # LLM 结构化输出做检索决策：通道规划 + 信息是否充分
+├── document_loader.py      # 上传文档解析：PDF/DOCX 正文与内嵌图片、VLM 图片描述、描述缓存
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
 ├── config.py               # 模型 / 密钥 / Chroma 路径 / 会话库路径的统一配置入口
@@ -56,6 +59,7 @@ bishe/
 ├── self_data/              # 示例私人语料（自我介绍、音乐分析、歌单）
 ├── chroma_db/              # Chroma 持久化数据（运行时生成，不入库）
 ├── sessions.db             # 会话库（运行时生成，不入库）
+├── uploaded_images/        # 上传文档抽出的图片与描述缓存（运行时生成，不入库）
 └── music-chatbot-frontend/ # React 前端
     └── src/
         ├── App.js          # 聊天界面、会话管理、知识库录入、文件上传
@@ -89,7 +93,7 @@ bishe/
 自反思过滤 (self_reflection) ──► 与问题相关的知识库信息 + 网络信息
    │
    ▼
-答案生成 (乐典助手 Prompt + 历史对话 + 上传文件)
+答案生成 (乐典助手 Prompt + 历史对话 + 上传文件正文及其图片描述)
    │
    ▼
 返回答案 & 记录会话
@@ -109,7 +113,7 @@ bishe/
 | POST | `/api/chat` | 发送消息，返回答案与 `session_id` |
 | GET | `/api/chat/history/{session_id}` | 查询会话历史（`number` 可选，默认 20） |
 | DELETE | `/api/chat/history/{session_id}` | 清空指定会话历史 |
-| POST | `/api/upload` | 上传 `.docx` 文件并提问 |
+| POST | `/api/upload` | 上传 `.pdf` / `.docx` 文件并提问（含图片描述），其它格式返回 400 |
 | POST | `/api/knowledge/self-introduction` | 写入个人信息 |
 | POST | `/api/knowledge/music-analysis` | 写入音乐理解 |
 | POST | `/api/knowledge/music-list` | 写入歌单 |
@@ -128,7 +132,7 @@ ChromaDB 以嵌入式方式运行，数据直接落盘到 `CHROMA_PERSIST_DIR`�
 ```bash
 pip install fastapi uvicorn langchain langchain-openai langchain-chroma langchain-classic \
     langchain-community chromadb rank-bm25 httpx tenacity jieba nltk rouge-score \
-    numpy torch python-multipart python-dotenv
+    numpy torch python-multipart python-dotenv pymupdf python-docx pillow
 ```
 
 ### 2. 配置模型与密钥
@@ -149,9 +153,11 @@ cp .env.example .env    # 然后填写 .env
 `SESSION_DB_PATH`（会话库文件路径，默认 `./sessions.db`）、
 `RERANK_TIMEOUT` / `WEB_SEARCH_TIMEOUT` / `HTTP_RETRIES`（外部调用的超时秒数与重试次数）、
 `MAX_SUPPLEMENT_ROUNDS`（检索不足时最多追加几轮补充检索，默认 2，设 0 关闭）、
+`VLM_MODEL` / `VLM_TIMEOUT`（上传文档的图片描述模型与超时，留空则不生成图片描述）、
+`IMAGE_MIN_SIZE`（小于该像素的图片直接丢弃，默认 100）、`UPLOAD_IMAGE_DIR`（抽出的图片与描述缓存目录）、
 `LOG_LEVEL` / `TRACE_TEXT_LIMIT`（日志级别与链路追踪里每段输入输出的预览字符上限）。
 
-业务侧统一通过 `config.get_chat_model()`、`config.get_embeddings()` 取实例，
+业务侧统一通过 `config.get_chat_model()`、`config.get_embeddings()`、`config.get_vlm()` 取实例，
 因此换模型只需改一处。缺失变量会抛出带操作提示的 `RuntimeError`，
 而不是在调用 API 时才报出难懂的 401。
 
@@ -397,7 +403,8 @@ for r in sorted(done, key=lambda x: -x.get('elapsed_ms', 0))[:10]:
   200 + 空列表，只有从未存在的 `session_id` 才返回 404。
 - 耗时的业务函数都是同步实现（LLM、`requests`、Chroma 都没有异步 API），直接在 `async def`
   端点里调用会占住事件循环，同一 worker 上的请求只能排队。现已用 `run_in_threadpool` 下沉到
-  线程池：RAG 链路在 [chat](file:///d:/bishe/main.py#L79-L80) / [upload](file:///d:/bishe/main.py#L152-L153)，
+  线程池：RAG 链路在 [chat](file:///d:/bishe/main.py#L79-L80)、上传解析与问答在
+  [upload](file:///d:/bishe/main.py#L121-L160)，
   知识库写入在 [三个 knowledge 端点](file:///d:/bishe/main.py#L171-L193)
   （`chunk_document` 与 `add_documents` 内部要调 Embedding，语料大时是秒级）。
   线程上限由 anyio 默认的 40 控制，超出后新请求会排队等待空闲线程。
@@ -415,7 +422,13 @@ for r in sorted(done, key=lambda x: -x.get('elapsed_ms', 0))[:10]:
   通道规划模型不可用时退化为「知识库与网络都检索」。每个 `request_id` 下最多约 12 次 LLM 调用，
   延迟上限由 `MAX_SUPPLEMENT_ROUNDS` 控制。
 - CORS 当前为 `allow_origins=["*"]`，仅适合本地开发。
-- 上传解析仅处理 `.docx`（本质是 zip 内 XML），其它格式不会提取到正文。
+- 上传解析支持 `.pdf`（PyMuPDF）与 `.docx`（python-docx + zip）；旧版 `.doc` 与其它格式返回 400。
+  解析走 [document_loader.py](file:///d:/bishe/document_loader.py)：正文按页/段落取文本，内嵌图片按
+  「尺寸过滤（< `IMAGE_MIN_SIZE` 丢弃）→ MD5 去重 → VLM 描述 → 描述缓存落盘」处理；页面无文字层
+  但有图时判定为扫描页，整页按 150dpi 渲染成一张图交给 VLM。未配置 `VLM_MODEL`、或单张图描述失败时，
+  该位置降级为占位文本（`[图片：未配置 VLM_MODEL…]` / `[图片：描述生成失败]`），不会让整篇上传失败。
+  图片描述以独立段落（`【图片内容（第 N 页）】…`）拼进 `file_content`，因此后续接知识库时应**单独成 chunk**，
+  避免与正文混切稀释检索精度。
 - 混合检索中的 BM25 索引在每次检索时从集合内全量文档重建（Chroma 只存稠密向量），
   语料规模较大时会有额外开销；`data_storage.py` 的 `DENSE_WEIGHT` / `SPARSE_WEIGHT` 可调融合权重。
 - 向量库已从 Milvus 迁移到 ChromaDB，旧的 `milvus-standalone/` 与 Docker Compose 已移除，

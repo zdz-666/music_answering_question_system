@@ -57,6 +57,17 @@ SESSION_DB_PATH = os.getenv("SESSION_DB_PATH", "./sessions.db")
 LLM_INPUT_PRICE_PER_MT = float(os.getenv("LLM_INPUT_PRICE_PER_MT", "0"))
 LLM_OUTPUT_PRICE_PER_MT = float(os.getenv("LLM_OUTPUT_PRICE_PER_MT", "0"))
 
+# ---- 上传文档解析（PDF / DOCX）----
+# 图像理解模型（VLM）：与对话模型共用同一个 OpenAI 兼容网关，只需换 model 名。
+# 留空表示不启用图片描述——上传仍可用，只是图片位置会标注为「未生成描述」。
+VLM_MODEL = os.getenv("VLM_MODEL", "")
+# 单张图片描述的等待上限；图片比文本慢，默认给到 30s
+VLM_TIMEOUT = float(os.getenv("VLM_TIMEOUT", "30"))
+# 宽或高小于该像素的图片直接丢弃（滤掉 logo、页码装饰、公式小图标）
+IMAGE_MIN_SIZE = int(os.getenv("IMAGE_MIN_SIZE", "100"))
+# 抽取出的图片与描述缓存落盘目录，已在 .gitignore 中排除
+UPLOAD_IMAGE_DIR = os.getenv("UPLOAD_IMAGE_DIR", "./uploaded_images")
+
 
 def get_chat_model(temperature: float = 0.1) -> ChatOpenAI:
     """对话模型实例。原先各文件各自 new 一个 ChatOpenAI，现在统一从这里取。"""
@@ -65,6 +76,28 @@ def get_chat_model(temperature: float = 0.1) -> ChatOpenAI:
         api_key=_env("OPENAI_API_KEY"),
         base_url=_env("OPENAI_BASE_URL"),
         temperature=temperature,
+        callbacks=[
+            TokenUsageCallback(
+                input_price_per_mtok=LLM_INPUT_PRICE_PER_MT,
+                output_price_per_mtok=LLM_OUTPUT_PRICE_PER_MT,
+            )
+        ],
+    )
+
+
+def get_vlm(temperature: float = 0.2) -> ChatOpenAI:
+    """图像理解模型（VLM）实例：与对话模型共用网关，仅 model 名不同。
+
+    超时与重试直接用 ChatOpenAI 自带的 timeout / max_retries，不再套 tenacity：
+    图片描述失败已在 document_loader 里降级为占位文本，不影响整篇解析。
+    """
+    return ChatOpenAI(
+        model=_env("VLM_MODEL"),
+        api_key=_env("OPENAI_API_KEY"),
+        base_url=_env("OPENAI_BASE_URL"),
+        temperature=temperature,
+        timeout=VLM_TIMEOUT,
+        max_retries=HTTP_RETRIES,
         callbacks=[
             TokenUsageCallback(
                 input_price_per_mtok=LLM_INPUT_PRICE_PER_MT,

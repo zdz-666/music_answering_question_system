@@ -443,7 +443,7 @@ function App() {
                     ref={fileInputRef}
                     onChange={handleFileSelect}
                     className="file-input"
-                    accept=".txt,.pdf,.doc,.docx"
+                    accept=".pdf,.docx"
                   />
                   {selectedFile && (
                     <div className="selected-file">

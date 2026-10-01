@@ -1,3 +1,4 @@
+import document_loader
 import rag
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
@@ -23,9 +24,6 @@ from session_store import (
     init_db,
     list_messages,
 )
-import zipfile
-import io
-import re
 
 
 @asynccontextmanager
@@ -120,53 +118,56 @@ async def upload_file(
     question: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
 ):
-    try:
-        content = await file.read()
-        zip_file = io.BytesIO(content)
+    content = await file.read()
 
-        all_text = []
+    # 解析在 document_loader 里分发：PDF（PyMuPDF）/ DOCX（python-docx），
+    # 图片会被抽出来交给 VLM 转成中文描述，一起拼进 file_content。
+    # 读文件与逐张调 VLM 都是同步阻塞的，必须下沉线程池。
+    with log_step(
+        "document.parse",
+        input={"file": file.filename, "bytes": len(content)},
+    ) as parse_span:
+        try:
+            blocks = await run_in_threadpool(
+                document_loader.parse_document, file.filename, content
+            )
+        except document_loader.UnsupportedFormatError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"文件处理失败: {str(exc)}")
 
-        with zipfile.ZipFile(zip_file, 'r') as z:
-            for filename in z.namelist():
-                if filename.endswith('.xml'):
-                    content = z.read(filename).decode('utf-8', errors='ignore')
-                    text = re.sub(r'<[^>]+>', ' ', content)
-                    text = re.sub(r'\s+', ' ', text).strip()
-                if text:
-                    all_text.append(text)
-        
-        file_content = " ".join(all_text)
+        file_content = document_loader.blocks_to_text(blocks)
+        parse_span.output = {
+            "blocks": len(blocks),
+            "images": sum(1 for block in blocks if block.kind == "image"),
+            "chars": len(file_content),
+        }
 
-        query_request = QueryRequest(
-            question=question or "请分析上传的文件",
-            session_id=session_id,
-            file_content=file_content
-        )
-        
-        session_id = get_or_create_session(query_request.session_id)
-        history_string = get_history_str(session_id)
-        
-        with log_step(
-            "rag.total",
-            input={"question": query_request.question, "file": file.filename},
-            session_id=session_id,
-        ) as span:
-            result = await run_in_threadpool(rag.get_result, query_request, history_string)
-            span.output = result.content
-        
-        add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
-        add_message(session_id, ChatMessage(role="assistant", content=result.content))
-        
-        response = ChatResponse(
-            answer=result.content,
-            session_id=session_id,
-            timestamp=datetime.now().isoformat()
-        )
-        
-        return response
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件处理失败: {str(e)}")
+    query_request = QueryRequest(
+        question=question or "请分析上传的文件",
+        session_id=session_id,
+        file_content=file_content
+    )
+
+    session_id = get_or_create_session(query_request.session_id)
+    history_string = get_history_str(session_id)
+
+    with log_step(
+        "rag.total",
+        input={"question": query_request.question, "file": file.filename},
+        session_id=session_id,
+    ) as span:
+        result = await run_in_threadpool(rag.get_result, query_request, history_string)
+        span.output = result.content
+
+    add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
+    add_message(session_id, ChatMessage(role="assistant", content=result.content))
+
+    return ChatResponse(
+        answer=result.content,
+        session_id=session_id,
+        timestamp=datetime.now().isoformat()
+    )
 
 # 三个写入端点同样会阻塞：chunk_document 与 add_documents 内部要调 Embedding（网络往返），
 # 语料大时是秒级，同步执行会占住事件循环，因此一并下沉到线程池。
