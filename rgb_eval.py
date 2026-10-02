@@ -3,11 +3,14 @@
 数据集：https://github.com/chen700564/RGB —— 300 条中文样本，字段
 `id / query / answer / positive / negative`。
 
-评测时先把样本自带的 positive + negative 合并成一篇文本，再用项目自己的
-SemanticChunker（dynamic_chunk.py）切成块，把这些块当作知识库内容传给
-rag.get_result_evaluate(query, external_docs=...)：通道规划、集合路由、
-网络搜索被跳过，查询重写 → 混合检索 → 重排 → 补充检索 → 自反思 →
-生成这整条链路保持与线上一致。
+评测时先把样本自带的 positive + negative 合并成一篇文本，再用切块器切成块，
+把这些块当作知识库内容传给 rag.get_result_evaluate(query, external_docs=...)：
+通道规划、集合路由、网络搜索被跳过，查询重写 → 混合检索 → 重排 → 补充检索 →
+自反思 → 生成这整条链路保持与线上一致。
+
+切块器可以用 --chunker 换（两种接口相同，便于对比切分方式对检索效果的影响）：
+- semantic：dynamic_chunk.SemanticChunker，按相邻句子的余弦相似度找语义边界；
+- fixed：fixed_chunk.FixedChunker，按固定长度等步长滑动窗口切，可设重叠。
 
 评测方法：
 - 逐条调 rag.get_result_evaluate(query, external_docs=...)，拿回 (检索到的上下文, 生成答案)；
@@ -21,6 +24,7 @@ rag.get_result_evaluate(query, external_docs=...)：通道规划、集合路由�
     python rgb_eval.py --limit 20        # 先跑 20 条试水
     python rgb_eval.py --offset 20 --limit 20
     python rgb_eval.py --chunk-size 500   # 换一个切块上限
+    python rgb_eval.py --chunker fixed --overlap 50   # 换成固定长度 + 重叠切分
     python rgb_eval.py --verbose         # 额外打印完整链路 JSON 日志
 """
 
@@ -35,6 +39,7 @@ from tqdm import tqdm
 
 import rag
 from dynamic_chunk import SemanticChunker
+from fixed_chunk import FixedChunker
 from observability import (
     ROOT_LOGGER_NAME,
     logger,
@@ -46,7 +51,9 @@ from observability import (
 # RGB 仓库默认分支是 master（不是 main）
 RGB_RAW_URL = "https://raw.githubusercontent.com/chen700564/RGB/master/data/zh_refine.json"
 DEFAULT_DATASET = os.path.join("data", "zh_refine.json")
-DEFAULT_OUTPUT = os.path.join("eval_results", "rgb_zh_predictions.jsonl")
+# 结果按切块方式分文件：断点续跑是靠 id 跳过的，两次不同切法的实验
+# 若写同一个文件，后一次会把前一次的条目全当已完成而直接跳过。
+DEFAULT_OUTPUT = os.path.join("eval_results", "rgb_zh_{chunker}_predictions.jsonl")
 
 
 def ensure_dataset(path: str) -> str:
@@ -123,12 +130,15 @@ def load_records(path: str) -> list:
     return records
 
 
-def build_corpus(instance: dict, chunker: SemanticChunker) -> list:
-    """样本的 positive + negative 合并成一篇文本，再用项目的切分算法切成检索单元。
+def build_corpus(instance: dict, chunker: SemanticChunker | FixedChunker) -> list:
+    """样本的 positive + negative 合并成一篇文本，再用切块器切成检索单元。
 
     positive 是能回答该问题的文档，negative 是语义相近但答不上的干扰文档；
-    合并后交给 SemanticChunker，产生的每一块才是一个检索单元——这样评测与
+    合并后交给 chunker，产生的每一块才是一个检索单元——这样评测与
     线上「整篇文档先切分再入库」的粒度一致。
+
+    chunker 可以是 SemanticChunker（语义边界）或 FixedChunker（固定长度 + 重叠），
+    两者接口相同，换一个就能对比不同切分方式对结果的影响。
     """
     parts = []
     for field in ("positive", "negative"):
@@ -146,7 +156,7 @@ def build_corpus(instance: dict, chunker: SemanticChunker) -> list:
     return [doc.page_content for doc in chunker.chunk_document(text)]
 
 
-def evaluate_one(instance: dict, chunker: SemanticChunker) -> dict:
+def evaluate_one(instance: dict, chunker: SemanticChunker | FixedChunker) -> dict:
     """跑一条样本。单条失败不中断整轮评测，错误照常记进明细。"""
     query = instance["query"]
     # 每个 query 单独一个 request_id，跑完可用 trace_view.py 按 id 还原该条的调用树
@@ -229,15 +239,30 @@ def main():
         "--dataset", default=DEFAULT_DATASET, help="zh_refine.json 路径，缺失时自动下载"
     )
     parser.add_argument(
-        "--output", default=DEFAULT_OUTPUT, help="逐条结果落盘路径（JSONL，已完成的 id 会自动跳过）"
+        "--output",
+        default=None,
+        help="逐条结果落盘路径（JSONL，已完成的 id 会自动跳过）；"
+        "默认按切块方式分文件，两次实验互不覆盖",
     )
     parser.add_argument("--limit", type=int, default=0, help="最多评测多少条，0 表示全部")
     parser.add_argument("--offset", type=int, default=0, help="从数据集第几条开始")
     parser.add_argument(
+        "--chunker",
+        choices=("semantic", "fixed"),
+        default="semantic",
+        help="切块方式：semantic=语义边界切分，fixed=固定长度 + 重叠切分",
+    )
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=300,
-        help="合并文本的语义切块上限，与线上 collection_create 的 max_chunk_size 一致",
+        help="切块长度上限（semantic 对应 max_chunk_size，fixed 为每块长度）",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=0,
+        help="相邻块的重叠长度，仅 fixed 或显式给 semantic 传值时才有重叠",
     )
     parser.add_argument("--sleep", type=float, default=0.0, help="每条之间的间隔秒数，防上游限流")
     parser.add_argument(
@@ -254,6 +279,18 @@ def main():
         logging.INFO if args.verbose else logging.WARNING
     )
 
+    # 没指定输出路径时按切块方式分文件，两次不同切法的实验可以并存对比
+    if not args.output:
+        args.output = DEFAULT_OUTPUT.format(chunker=args.chunker)
+
+    # 切块器只建一次：SemanticChunker 内部持有嵌入模型，每条样本重建一遍没有意义
+    if args.chunker == "fixed":
+        chunker = FixedChunker(overlap_size=args.overlap, chunk_size=args.chunk_size)
+    else:
+        chunker = SemanticChunker(
+            overlap_size=args.overlap, max_chunk_size=args.chunk_size
+        )
+
     instances = load_instances(ensure_dataset(args.dataset))[args.offset :]
     if args.limit > 0:
         instances = instances[: args.limit]
@@ -266,11 +303,17 @@ def main():
     pending = [instance for instance in instances if instance["id"] not in done]
     logger.info(
         "rgb_eval.start",
-        extra={"fields": {"selected": len(instances), "pending": len(pending)}},
+        extra={
+            "fields": {
+                "selected": len(instances),
+                "pending": len(pending),
+                "chunker": args.chunker,
+                "chunk_size": args.chunk_size,
+                "overlap": args.overlap,
+                "output": args.output,
+            }
+        },
     )
-
-    # 切块器只建一次：它内部持有嵌入模型，每条样本重建一遍没有意义
-    chunker = SemanticChunker(overlap_size=0, max_chunk_size=args.chunk_size)
 
     hits = 0
     failures = 0
