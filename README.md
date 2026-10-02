@@ -18,7 +18,8 @@
 - **文件问答**：上传 `.pdf` / `.docx`，同时解析正文与内嵌图片——图片由视觉模型（VLM）
   转成中文描述后一起参与问答，扫描页（无文字层）自动整页渲染识别。
 - **知识库动态写入**：可在前端直接录入「个人信息 / 音乐理解 / 歌单」三类私人数据。
-- **离线评测（llm_ev.py）**：内置 BLEU、ROUGE 与 LLM 忠诚度打分（0/1/2）脚本。
+- **离线评测**：内置 BLEU、ROUGE 与 LLM 忠诚度打分脚本（`llm_ev.py`），以及在 RGB 中文基准
+  `zh_refine.json`（300 条）上的端到端评测（`rgb_eval.py`，当前准确率 91%）。
 
 ---
 
@@ -49,6 +50,7 @@ bishe/
 ├── document_loader.py      # 上传文档解析：PDF/DOCX 正文与内嵌图片、VLM 图片描述、描述缓存
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
+├── fixed_chunk.py          # 固定长度 + 重叠的等步长切分（FixedChunker），用于对比切分方式
 ├── config.py               # 模型 / 密钥 / Chroma 路径 / 会话库路径的统一配置入口
 ├── observability.py        # 链路追踪 + 结构化日志：span、JSON 格式、分步输入输出/耗时/token
 ├── trace_view.py           # 按 request_id 把日志还原成调用树（离线看链路）
@@ -56,6 +58,8 @@ bishe/
 ├── models/                 # 接口层与业务层共用的 Pydantic 数据结构
 ├── .env.example            # 环境变量模板（复制为 .env 后填写）
 ├── llm_ev.py               # 评测脚本：BLEU / ROUGE / LLM 忠诚度
+├── rgb_eval.py             # RGB 中文基准评测：合并 positive/negative → 切块 → 走完整 RAG 链路
+├── eval_results/           # 评测逐条明细与汇总（运行时生成，不入库）
 ├── self_data/              # 示例私人语料（自我介绍、音乐分析、歌单）
 ├── chroma_db/              # Chroma 持久化数据（运行时生成，不入库）
 ├── sessions.db             # 会话库（运行时生成，不入库）
@@ -103,6 +107,8 @@ bishe/
 
 分块策略见 [dynamic_chunk.py](file:///d:/bishe/dynamic_chunk.py)：先按中英文标点切句，逐句向量化，
 相邻句余弦相似度低于 `0.7` 处切分，再按 `max_chunk_size` 强制截断并支持重叠。
+另有一种不做语义判断、按固定长度等步长（可带重叠）切分的 [fixed_chunk.py](file:///d:/bishe/fixed_chunk.py)，
+两者接口一致，评测时可切换以对比切分方式的影响。
 
 ---
 
@@ -193,6 +199,36 @@ npm start
 ---
 
 ## 评测
+
+### RGB 中文基准（zh_refine.json）
+
+在 RGB 中文数据集的 `zh_refine.json`（300 条）上跑了完整 RAG 链路，**准确率 91%**（273/300）：
+
+| 指标 | 值 |
+| --- | --- |
+| 样本数 | 300 |
+| 命中率（RGB 官方 `all_rate`） | **0.91**（273 条） |
+| 拒答率（`refusal_rate`） | 0.00 |
+| 异常条数 | 0 |
+| 单条平均耗时 | 20.4 s |
+
+评测口径与 RGB 官方一致：每条样本把自带的 `positive` + `negative` 合并成一篇文本，
+按固定长度切分（`--chunker fixed`，`chunk_size=300`）切成检索单元当知识库，
+只把 `query` 交给 `rag.get_result_evaluate()`——通道规划、集合路由、网络搜索被关闭，
+「查询重写 → 混合检索 → 重排 → 补充检索 → 自反思 → 生成」这条链路与线上完全一致。
+判定用官方 `checkanswer`：参考答案的每一条都要作为子串出现在生成答案中才算命中。
+
+```bash
+python rgb_eval.py --chunker fixed              # 全量 300 条，结果落在 eval_results/
+python rgb_eval.py --chunker fixed --limit 20   # 先跑 20 条试水
+```
+
+`--chunker` 可在 `fixed`（固定长度，配 `--overlap` 设重叠）与 `semantic`（dynamic_chunk 的
+语义边界切分）之间切换，两种切法的结果分文件存放，便于对比切分方式的影响。逐条明细
+（生成答案、检索上下文、命中标签）落在 `eval_results/rgb_zh_{chunker}_predictions.jsonl`，
+汇总落在同目录的 `_summary.json`。
+
+### 单条质量评测（llm_ev.py）
 
 单条问题走完整 RAG 链路后，输出检索上下文与生成答案的 BLEU、ROUGE-1/2/L 以及 LLM 忠诚度得分：
 
