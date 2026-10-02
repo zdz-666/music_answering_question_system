@@ -7,6 +7,12 @@ sessions.db*
 # 上传文档抽出的图片与描述缓存（本地运行时生成，勿提交）
 uploaded_images/
 
+# RGB 评测数据集（第三方数据，由 rgb_eval.py 首次运行时下载）
+data/
+
+# 评测结果（本地运行时生成，勿提交）
+eval_results/
+
 # Python
 __pycache__/
 *.py[cod]

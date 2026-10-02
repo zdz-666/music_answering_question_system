@@ -2,7 +2,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from collection_router import get_router_collection
 from models import QueryRequest
 from dynamic_chunk import SemanticChunker
-from data_storage import vector_similarity_search, load_vector_store
+from data_storage import (
+    in_memory_similarity_search,
+    load_vector_store,
+    vector_similarity_search,
+)
 from config import (
     HTTP_RETRIES,
     MAX_SUPPLEMENT_ROUNDS,
@@ -274,13 +278,28 @@ def route_collections(question: str) -> list:
     return collection_list
 
 
-def get_vector_search(query, collection_list) -> list:
+def get_vector_search(query, collection_list, external_docs=None) -> list:
     """在给定集合列表上做混合检索 + 重排，返回重排后的 chunk 列表。
 
     返回 list[str]（而不是拼好的大字符串）是为了让多轮检索结果能按 chunk 粒度去重。
+    external_docs 非 None 时改在调用方给的这批文本里检索（评测场景），忽略 collection_list。
     """
     result = []
     query_change = query_rewriting(query)
+
+    if external_docs is not None:
+        with log_step(
+            "vector_search",
+            input=query_change,
+            corpus="external",
+            docs=len(external_docs),
+            k=6,
+        ) as span:
+            vector_result = in_memory_similarity_search(external_docs, query_change, k=6)
+            # Document 对象直接进日志会是 <Document ...> 这样的 repr，这里只取正文
+            span.output = [doc.page_content for doc in vector_result]
+        return rerank(vector_result, query_change)
+
     for co_name in collection_list:
         with log_step(
             "vector_search", input=query_change, collection=co_name, k=6
@@ -361,11 +380,14 @@ def _channel_label(uses_kb: bool, uses_web: bool) -> str:
     return "knowledge_base" if uses_kb else "web_search"
 
 
-def _supplement_retrieval(question, uses_kb, uses_web, collection_list, kb_chunks, web_items):
+def _supplement_retrieval(
+    question, uses_kb, uses_web, collection_list, kb_chunks, web_items, external_docs=None
+):
     """信息不足时用新语句再检索，最多 MAX_SUPPLEMENT_ROUNDS 轮。
 
     通道沿用首轮决策，集合名沿用首轮结果。任何异常都只终止补检索、
     保留已有结果继续往下走（上游抖动不该把整条问答打成 500）。
+    external_docs 非 None 时补检索同样落在调用方给的语料上（评测场景）。
     """
     seen_queries = {_normalize_query(question)}
     for round_index in range(1, MAX_SUPPLEMENT_ROUNDS + 1):
@@ -402,7 +424,8 @@ def _supplement_retrieval(question, uses_kb, uses_web, collection_list, kb_chunk
         try:
             if uses_kb:
                 kb_chunks = merge_kb_chunks(
-                    kb_chunks, get_vector_search(new_query, collection_list)
+                    kb_chunks,
+                    get_vector_search(new_query, collection_list, external_docs=external_docs),
                 )
             if uses_web:
                 web_items = merge_web_items(web_items, get_web_search(new_query))
@@ -422,12 +445,22 @@ def _supplement_retrieval(question, uses_kb, uses_web, collection_list, kb_chunk
     return kb_chunks, web_items
 
 
-def _retrieve_and_reflect(question: str) -> str:
+def _retrieve_and_reflect(question: str, external_docs: list | None = None) -> str:
     """通道规划 → 首轮检索 → 补充检索 → 自反思，返回可直接作为 {context} 的字符串。
 
     通道规划必须放在最前面：它决定 collection_router / web_rewriting 要不要跑，
     放晚了关掉的通道会被白跑一遍。
+
+    external_docs 非 None 时进入评测模式：跳过通道规划、集合路由与联网搜索，
+    只在调用方给的这批文本里检索；其后的重排、补充检索、自反思链路完全一致。
     """
+    if external_docs is not None:
+        kb_chunks = get_vector_search(question, [], external_docs=external_docs)
+        kb_chunks, _ = _supplement_retrieval(
+            question, True, False, [], kb_chunks, [], external_docs=external_docs
+        )
+        return self_reflection(question, format_kb_chunks(kb_chunks), format_web_items([]))
+
     plan = plan_retrieval_channels(question)
 
     if not plan.use_knowledge_base and not plan.use_web_search:
@@ -549,31 +582,24 @@ def add_music_list(text: str):
     vector_store = load_vector_store("music_list")
     vector_store.add_documents(docs)
 
-def get_result_evaluate(query: str):
+def get_result_evaluate(query: str, external_docs: list | None = None):
      # 与 get_result 共用同一条「通道规划 → 检索 → 补充检索 → 自反思」链路，
      # 只有生成用的 prompt 不同（评测场景不带历史与上传文件）。
-     context = _retrieve_and_reflect(query)
+     # external_docs 非 None 时把检索语料换成调用方给的一批文本
+     # （如 RGB 评测里的 positive/negative 文档），链路其余部分不变。
+     context = _retrieve_and_reflect(query, external_docs=external_docs)
 
      prompt_template = """
-        你是一个专业的音乐知识问答助手，名为“乐典”。你的核心职责是准确、专业、清晰地回答用户关于音乐的一切问题。
-        理解与分析：仔细分析用户输入的问题，明确其核心意图和所需的知识范畴。
+       你是一个专业的知识问答助手。
 
-        信息检索与整合：
-        融合信息：将内部知识、网络搜索结果以及知识库信息进行智能比对、验证与融合，形成完整的答案。
+约束条件（必须严格遵守）：
+1. 你只能基于用户提供的【相关信息】来回答问题，严禁使用你自身的知识或外部信息。
+2. 如果用户提供的信息中没有任何内容与问题相关，或信息不足以回答该问题，你必须明确拒绝回答，回复"根据提供的信息无法回答该问题"或类似表述，严禁编造答案。
+3. 你的回答应当严格基于给定信息，简洁明了，不要做额外的解释。
 
-        组织与输出：你的回答应当结构清晰、重点突出、语言友好。
-        输出格式要求（必须严格遵守，前端会按 Markdown 渲染）：
-        - 始终使用 Markdown 格式组织回答，不要输出大段无结构的纯文本。
-        - 小节标题使用 ## 或 ###，不要使用一级标题 #。
-        - 并列的内容使用无序列表（- ），有先后顺序的内容使用有序列表（1. 2. 3.）。
-        - 关键术语、曲名、作品名、人名使用 **加粗** 强调，但不要整段加粗。
-        - 需要横向对比多项内容时，使用 Markdown 表格呈现。
-        - 引用原文或他人观点时使用 > 引用块。
-        - 直接输出 Markdown 正文本身，严禁把整个回答包裹在 ``` 代码块中。
+用户的问题是：{question}
 
-        用户的问题是：{question}
-
-        与用户提问相关的信息是：{context}
+与用户提问相关的信息是：{context}
         """
      result = _generate(
          prompt_template,

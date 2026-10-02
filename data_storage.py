@@ -4,6 +4,7 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.document_loaders import TextLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
+from langchain_core.vectorstores import InMemoryVectorStore
 
 from config import CHROMA_PERSIST_DIR, get_embeddings
 from dynamic_chunk import SemanticChunker
@@ -96,6 +97,31 @@ def vector_similarity_search(collection_name, query, k):
         return []
 
     sparse_retriever = BM25Retriever.from_documents(documents, k=k)
+
+    ensemble = EnsembleRetriever(
+        retrievers=[dense_retriever, sparse_retriever],
+        weights=[DENSE_WEIGHT, SPARSE_WEIGHT],
+    )
+    return ensemble.invoke(query)
+
+
+def in_memory_similarity_search(documents: list, query, k):
+    """在调用方给的一批文本上做「稠密 + 稀疏」混合检索，语义与 vector_similarity_search 一致。
+
+    给语料不在 Chroma 里的场景用（评测时把外部语料当作知识库）：向量索引只在本次调用内
+    构建，跑完即丢，既不落盘也不影响已有集合。
+    """
+    docs = [Document(page_content=text) for text in documents if str(text).strip()]
+    if not docs:
+        return []
+
+    # 语料可能比 k 还小（评测时一条样本只有几篇文档），先收敛 k，避免底层越界
+    k = min(k, len(docs))
+
+    dense_retriever = InMemoryVectorStore.from_documents(
+        docs, embedding=get_embeddings()
+    ).as_retriever(search_kwargs={"k": k})
+    sparse_retriever = BM25Retriever.from_documents(docs, k=k)
 
     ensemble = EnsembleRetriever(
         retrievers=[dense_retriever, sparse_retriever],
