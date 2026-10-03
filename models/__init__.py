@@ -13,6 +13,9 @@ class QueryRequest(BaseModel):
     session_id: Optional[str] = None
     # 是否走知识库 / 网络检索由 retrieval_planner 依据提问自动决定，不再由调用方指定
     file_content: Optional[str] = None
+    # 用户身份：情景记忆与用户画像按它隔离（"跨会话"= 同一 user_id 的多个 session）。
+    # 缺省为空，此时整个记忆层跳过，保证评测脚本与裸调用不受影响。
+    user_id: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
@@ -32,3 +35,5 @@ class ChatHistoryResponse(BaseModel):
     messages: List[ChatMessage]
     total: int
     timestamp: str
+    # 已把较早轮次压缩成摘要，加载历史时前端可以一并展示，避免"历史忽然变短"
+    summary: Optional[str] = None

@@ -68,6 +68,23 @@ IMAGE_MIN_SIZE = int(os.getenv("IMAGE_MIN_SIZE", "100"))
 # 抽取出的图片与描述缓存落盘目录，已在 .gitignore 中排除
 UPLOAD_IMAGE_DIR = os.getenv("UPLOAD_IMAGE_DIR", "./uploaded_images")
 
+# ---- 三层记忆（工作记忆 / 情景记忆 / 用户画像）----
+# 情景记忆：跨会话的历史问答，按 user_id 过滤 + 语义相似度检索
+# 用户画像：从对话里抽取的长期偏好与实体，一条一个原子事实
+EPISODIC_COLLECTION = os.getenv("EPISODIC_COLLECTION", "episodic_memory")
+PROFILE_COLLECTION = os.getenv("PROFILE_COLLECTION", "user_profile")
+# 注入 prompt 的记忆条数上限
+EPISODIC_TOP_K = int(os.getenv("EPISODIC_TOP_K", "3"))
+PROFILE_TOP_K = int(os.getenv("PROFILE_TOP_K", "5"))
+# 单条记忆注入 prompt 时的截断长度，防止一条长回答把上下文挤爆
+MEMORY_SNIPPET_CHARS = int(os.getenv("MEMORY_SNIPPET_CHARS", "200"))
+
+# 情景记忆的时间衰减：recency = exp(-EPISODIC_DECAY_FACTOR * age_hours / 24)
+# 0.1 时：1 天前约 0.90、1 周前约 0.50、1 个月前约 0.05（越近的对话越容易被召回）
+EPISODIC_DECAY_FACTOR = float(os.getenv("EPISODIC_DECAY_FACTOR", "0.1"))
+# 情景记忆的最终得分 = (1 - w) * 向量相似度 + w * 时间近因性
+EPISODIC_RECENCY_WEIGHT = float(os.getenv("EPISODIC_RECENCY_WEIGHT", "0.3"))
+
 
 def get_chat_model(temperature: float = 0.1) -> ChatOpenAI:
     """对话模型实例。原先各文件各自 new 一个 ChatOpenAI，现在统一从这里取。"""

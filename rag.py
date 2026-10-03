@@ -529,16 +529,25 @@ def self_reflection(query, vector_result, web_result):
     logger.info("self_reflection.result", extra={"fields": {"content": result.content}})
     return result.content
 
-def get_result(query: QueryRequest, history_string: str):
+def get_result(query: QueryRequest, history_string: str, memory_string: str = ""):
      # 检索通道（知识库 / 网络）改由 retrieval_planner 依据提问自动决定，
      # 不再读 query 上的开关字段。
      context = _retrieve_and_reflect(query.question)
+
+     # 三层记忆由 memory 包拼好后从外部注入，检索链路本身不感知记忆的存在。
+     # 没有记忆时不渲染标题，避免 prompt 里出现一个空段落。
+     memory_block = (
+         "\n关于该用户的长期记忆（跨会话，供个性化参考，可能与本次提问无关，请谨慎使用）：\n"
+         f"{memory_string}\n"
+         if memory_string
+         else ""
+     )
 
      prompt_template = """
         你是一个专业的音乐知识问答助手，名为“乐典”。你的核心职责是准确、专业、清晰地回答用户关于音乐的一切问题。
         理解与分析：仔细分析用户输入的问题，明确其核心意图和所需的知识范畴。
         用户之前的聊天记录：{history_string}
-
+        {memory_block}
         信息检索与整合：
         融合信息：将内部知识、网络搜索结果以及知识库信息进行智能比对、验证与融合，形成完整的答案。
 
@@ -561,10 +570,12 @@ def get_result(query: QueryRequest, history_string: str):
          {
              "question": query.question,
              "history_string": history_string,
+             "memory_block": memory_block,
              "file_content": query.file_content,
              "context": context,
          },
          has_file=bool(query.file_content),
+         has_memory=bool(memory_string),
      )
 
 def add_self_introduction(text: str):

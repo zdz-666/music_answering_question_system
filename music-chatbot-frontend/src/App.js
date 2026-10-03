@@ -4,10 +4,29 @@ import remarkGfm from 'remark-gfm';
 import { chatAPI } from './service/api.js';
 import './App.css';
 
+// 用户身份：后端按它隔离情景记忆与用户画像（"跨会话"= 同一 user_id 的多个会话）。
+// 生成一次后写进 localStorage，刷新页面仍保持同一身份，记忆才不会断。
+const USER_ID_KEY = 'music_rag_user_id';
+
+function getUserId() {
+  try {
+    let id = localStorage.getItem(USER_ID_KEY);
+    if (!id) {
+      id = `user_${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem(USER_ID_KEY, id);
+    }
+    return id;
+  } catch (error) {
+    // localStorage 不可用（隐私模式等）时退化成一次性身份，功能仍可用
+    return `user_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
 function App() {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [sessionId, setSessionId] = useState('');
+  const [userId] = useState(getUserId);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [selectedFile, setSelectedFile] = useState(null);
@@ -49,6 +68,7 @@ function App() {
       const response = await chatAPI.sendMessage({
         question: inputText,
         sessionId: sessionId, // 直接使用当前的sessionId，如果为null则由后端生成
+        userId, // 身份，后端据此隔离跨会话记忆
       });
 
       // 更新会话ID（后端会返回正确的session_id）
@@ -91,7 +111,16 @@ function App() {
 
     try {
       const response = await chatAPI.getHistory(sessionId);
-      setMessages(response.messages);
+      const historyMessages = response.messages || [];
+      // 后端会把较早轮次压缩成摘要，一并展示，避免"加载历史后只剩最后几条"
+      const summaryMessage = response.summary
+        ? [{
+            role: 'assistant',
+            content: `【此前对话摘要】\n${response.summary}`,
+            timestamp: response.timestamp,
+          }]
+        : [];
+      setMessages([...summaryMessage, ...historyMessages]);
     } catch (error) {
       alert('加载历史记录失败');
     }
@@ -139,7 +168,7 @@ function App() {
 
     setUploading(true);
     try {
-      const response = await chatAPI.uploadFile(selectedFile, fileQuestion.trim() || null);
+      const response = await chatAPI.uploadFile(selectedFile, fileQuestion.trim() || null, sessionId, userId);
       
       let userContent = `已上传文件: ${selectedFile.name}`;
       if (fileQuestion.trim()) {
@@ -274,6 +303,9 @@ function App() {
                 className="session-input"
               />
               <p className="session-hint">修改会话ID可切换到不同对话</p>
+              <h4>身份 ID</h4>
+              <p className="session-hint">{userId}</p>
+              <p className="session-hint">跨会话记忆按该身份隔离，清除浏览器数据会重新生成</p>
             </div>
 
             <div className="knowledge-section">

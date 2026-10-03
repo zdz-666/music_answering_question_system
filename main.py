@@ -1,4 +1,5 @@
 import document_loader
+import memory
 import rag
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
@@ -21,6 +22,7 @@ from session_store import (
     clear_messages,
     get_history_str,
     get_or_create_session,
+    get_summary,
     init_db,
     list_messages,
 )
@@ -68,19 +70,36 @@ async def request_logging(request, call_next):
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(query: QueryRequest):
 
+    user_id = (query.user_id or "").strip()
     session_id = get_or_create_session(query.session_id)
     history_string = get_history_str(session_id)
+
+    # 情景记忆 / 用户画像的相似度检索要走 Embedding 网络往返，必须下沉线程池
+    with log_step(
+        "memory.build_context", session_id=session_id, user_id=user_id
+    ) as memory_span:
+        memory_string = await run_in_threadpool(
+            memory.build_context, user_id, session_id, query.question
+        )
+        memory_span.output = memory_string
 
     # rag.get_result 是同步阻塞函数（内部是同步 LLM / requests / Chroma 调用），
     # 直接在 async 端点里调用会占住事件循环，同一 worker 上的其它请求全部排队。
     # 下沉到线程池后本进程才能并发处理请求；request_id 与 token 计量靠 contextvars 传递。
     with log_step("rag.total", input=query.question, session_id=session_id) as span:
-        result = await run_in_threadpool(rag.get_result, query, history_string)
+        result = await run_in_threadpool(
+            rag.get_result, query, history_string, memory_string
+        )
         span.output = result.content
 
     add_message(session_id, ChatMessage(role="user", content=query.question))
     add_message(session_id, ChatMessage(role="assistant", content=result.content))
-    
+
+    # 一轮结束后更新记忆：压缩工作记忆（LLM）+ 写情景记忆/画像（Embedding），同样是阻塞操作
+    await run_in_threadpool(
+        memory.after_turn, user_id, session_id, query.question, result.content
+    )
+
     response = ChatResponse(
         answer=result.content,
         session_id=session_id,
@@ -99,7 +118,8 @@ async def get_history(session_id: str, number: int = Query(20, ge=1, le = 100)):
         session_id=session_id,
         messages=messages,
         total=len(messages),
-        timestamp=datetime.now().isoformat()
+        timestamp=datetime.now().isoformat(),
+        summary=get_summary(session_id),
     )
 
     return response
@@ -117,6 +137,7 @@ async def upload_file(
     file: UploadFile = File(...),
     question: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None),
 ):
     content = await file.read()
 
@@ -149,19 +170,35 @@ async def upload_file(
         file_content=file_content
     )
 
+    user_id = (user_id or "").strip()
     session_id = get_or_create_session(query_request.session_id)
     history_string = get_history_str(session_id)
+
+    # 与 /api/chat 同构：先取三层记忆，再交给检索与生成；上传场景的记忆检索同样要下沉线程池
+    with log_step(
+        "memory.build_context", session_id=session_id, user_id=user_id
+    ) as memory_span:
+        memory_string = await run_in_threadpool(
+            memory.build_context, user_id, session_id, query_request.question
+        )
+        memory_span.output = memory_string
 
     with log_step(
         "rag.total",
         input={"question": query_request.question, "file": file.filename},
         session_id=session_id,
     ) as span:
-        result = await run_in_threadpool(rag.get_result, query_request, history_string)
+        result = await run_in_threadpool(
+            rag.get_result, query_request, history_string, memory_string
+        )
         span.output = result.content
 
     add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
     add_message(session_id, ChatMessage(role="assistant", content=result.content))
+
+    await run_in_threadpool(
+        memory.after_turn, user_id, session_id, query_request.question, result.content
+    )
 
     return ChatResponse(
         answer=result.content,

@@ -14,7 +14,7 @@
 - **智能路由（Collection Router）**：由 LLM 判断问题应该落到哪个集合，支持多集合同时命中。
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%。
 - **自反思过滤（Self-Reflection）**：在生成答案前，先由 LLM 从知识库/网络结果中剔除无关信息。
-- **多轮对话**：后端按 `session_id` 维护会话，最多保留最近 20 条消息，生成时注入最近 4 条作为上下文；会话落盘在 SQLite，多 worker 共享、重启不丢。
+- **多轮对话 + 三层记忆**：会话落盘在 SQLite（多 worker 共享、重启不丢），并在此基础上分三层记忆——**工作记忆**（最近 4 条消息 + 超过阈值后由 LLM 压缩出的滚动摘要）、**情景记忆**（同一 `user_id` 的跨会话历史问答，Chroma 按语义相似度检索）、**用户画像**（从对话中抽取的长期偏好与实体，Chroma 存储）。
 - **文件问答**：上传 `.pdf` / `.docx`，同时解析正文与内嵌图片——图片由视觉模型（VLM）
   转成中文描述后一起参与问答，扫描页（无文字层）自动整页渲染识别。
 - **知识库动态写入**：可在前端直接录入「个人信息 / 音乐理解 / 歌单」三类私人数据。
@@ -54,7 +54,12 @@ bishe/
 ├── config.py               # 模型 / 密钥 / Chroma 路径 / 会话库路径的统一配置入口
 ├── observability.py        # 链路追踪 + 结构化日志：span、JSON 格式、分步输入输出/耗时/token
 ├── trace_view.py           # 按 request_id 把日志还原成调用树（离线看链路）
-├── session_store.py        # 会话持久化：SQLite 建表、消息增删查、20 条裁剪
+├── session_store.py        # 会话持久化：SQLite 建表、消息增删查、滚动摘要与压缩认领
+├── memory/                 # 三层记忆
+│   ├── __init__.py         #   对外入口：build_context（取记忆）/ after_turn（写记忆）
+│   ├── working.py          #   工作记忆：消息超阈值时用 LLM 压缩成滚动摘要
+│   ├── episodic.py         #   情景记忆：跨会话问答的 Chroma 读写
+│   └── profile.py          #   用户画像：长期偏好/实体的抽取与检索
 ├── models/                 # 接口层与业务层共用的 Pydantic 数据结构
 ├── .env.example            # 环境变量模板（复制为 .env 后填写）
 ├── llm_ev.py               # 评测脚本：BLEU / ROUGE / LLM 忠诚度
@@ -97,7 +102,7 @@ bishe/
 自反思过滤 (self_reflection) ──► 与问题相关的知识库信息 + 网络信息
    │
    ▼
-答案生成 (乐典助手 Prompt + 历史对话 + 上传文件正文及其图片描述)
+答案生成 (乐典助手 Prompt + 历史对话 + 三层记忆 + 上传文件正文及其图片描述)
    │
    ▼
 返回答案 & 记录会话
@@ -109,6 +114,50 @@ bishe/
 相邻句余弦相似度低于 `0.7` 处切分，再按 `max_chunk_size` 强制截断并支持重叠。
 另有一种不做语义判断、按固定长度等步长（可带重叠）切分的 [fixed_chunk.py](file:///d:/bishe/fixed_chunk.py)，
 两者接口一致，评测时可切换以对比切分方式的影响。
+
+### 三层记忆
+
+记忆分三层，各自独立、互不阻塞（任一层失败只打 warning，不影响回答返回）。
+记忆只在生成 prompt 里作为独立段落注入，检索链路与评测路径（`get_result_evaluate`）完全不感知。
+
+| 层 | 存储 | 内容 | 读写时机 |
+| --- | --- | --- | --- |
+| 工作记忆 | SQLite `messages` / `session_summaries` | 最近 4 条消息 + 一段滚动摘要 | 每轮直接读；消息超过 `HISTORY_WINDOW + COMPRESS_BATCH`（14）条时由 LLM 把最旧一批并入摘要并删除 |
+| 情景记忆 | Chroma 集合 `episodic_memory` | 同一 `user_id` 的跨会话历史问答 | 每轮写一条；回答前按「语义相似度 + 时间近因性」加权排序，排除当前会话 |
+| 用户画像 | Chroma 集合 `user_profile` | 长期偏好与实体（一条一个原子事实） | 每轮由 LLM 抽取（失败降级为空）；回答前按语义相似度检索 |
+
+**情景记忆的时间衰减**：同样相关时，刚聊过的内容优先于很久以前的。每条记忆的 `metadata.timestamp`
+（ISO 时间）参与打分，最终得分把两项加权求和：
+
+```
+recency_score = exp(-decay_factor * age_hours / 24)     # decay_factor 默认 0.1
+final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
+```
+
+`decay_factor = 0.1` 时，1 天前约 0.90、1 周前约 0.50、1 个月前约 0.05。
+
+相似度由 Chroma 的距离折算：本集合 `hnsw.space = l2`，Chroma 在 l2 空间返回的是**平方**欧氏距离，
+而嵌入是 4096 维单位向量，故 `cos(q,v) = 1 - d/2`（负相关截到 0）。这里**不能**照搬 langchain 的
+`1 - d/√2` —— 它假设 d 是普通 L2 距离，套在平方距离上会恒为负、把所有候选压成 0。
+
+折算出的绝对余弦还会在**候选集内做一次 min-max 归一化**再参与加权：本模型对长短文本的余弦值被
+压在很窄的带里（实测同主题约 0.25、不同主题约 0.20，只差 0.055），绝对量纲下相似度最多只能贡献
+`0.7×0.055 ≈ 0.039` 分，会被 `0.3×1.0 = 0.3` 的近因性完全淹没，变成「几乎只看时间」。归一化后两项
+同在 [0,1]，`w` 才真正控制「相似度 vs 时间」的平衡（候选只有一个或全部同分时取 1.0，排序交给近因性）。
+
+检索时会多取候选再重排（`max(4k, k+5)` 条），否则只按距离截前 k 条的话，被近因性提上来的旧记忆
+根本没机会进入候选集。每次重排会打一条 `memory.episodic_rank` 日志，带 `cos_band` 与各候选的
+`final / relevance / cosine / recency`，便于观察权重是否合适。时间戳缺失或损坏的记录按「最旧」处理
+（近因性 0 分），不会靠新鲜度占便宜。
+
+- **身份隔离**：前端首次访问生成 `user_id` 并存入 `localStorage`（`music_rag_user_id`），随请求带给后端。
+  「跨会话」指同一 `user_id` 下的多个 `session_id`。请求不带 `user_id` 时整个记忆层跳过，
+  因此 `llm_ev.py` / `rgb_eval.py` 等离线评测不受影响。
+- **压缩走两阶段**：`claim_compression`（抢压缩权）→ LLM 生成摘要 → `commit_compression`（同一事务写摘要 + 按 id 删消息 + 释放认领）。
+  LLM 调用不在事务内，`compression_claims` 保证多 worker 下同一会话不会被重复压缩，认领 60s 过期以兜住进程崩溃。
+- **确定性文档 id**：情景记忆用 `md5(user_id | session_id | 问答)`，画像用 `md5(user_id | 事实文本)`，
+  借助 Chroma 的 upsert 天然幂等去重。
+- 可调参数：`EPISODIC_TOP_K`、`PROFILE_TOP_K`、`MEMORY_SNIPPET_CHARS`、`EPISODIC_DECAY_FACTOR`、`EPISODIC_RECENCY_WEIGHT`、`EPISODIC_COLLECTION`、`PROFILE_COLLECTION`（见 `.env.example`）。
 
 ---
 
