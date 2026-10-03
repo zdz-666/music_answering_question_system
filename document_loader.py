@@ -1,10 +1,14 @@
-"""文档解析层：把上传的 PDF / DOCX 统一解析成 ParsedBlock 列表。
+"""文档解析层：把上传的 PDF / DOCX / 图片统一解析成 ParsedBlock 列表。
 
 为什么单独抽一层：
 - 原先 /api/upload 只认 zip 里的 XML，PDF / Word 根本读不出内容；
 - 更关键的是图片：PDF 的图片不在文字层里，只调 page.get_text() 会把整张图丢掉。
   这里把图片抽出来，交给视觉模型（VLM）转成中文描述，再当作普通文本块参与问答，
   于是下游（检索、生成）只认 ParsedBlock，完全不感知原始文件格式。
+
+单独上传的图片文件（.png / .jpg / .jpeg / .gif / .webp）复用同一条图片管线，
+唯一区别是不做"太小就丢弃"的过滤——那个过滤是给文档内嵌图准备的，
+用户显式上传一张图时再小也该读。
 
 图片管线：尺寸过滤（滤掉 logo / 页码装饰）→ MD5 去重 → VLM 描述 → 描述缓存落盘。
 描述缓存按图片 MD5 存 JSON，跨请求复用，避免同一张图反复花钱。
@@ -27,7 +31,8 @@ from config import IMAGE_MIN_SIZE, UPLOAD_IMAGE_DIR, VLM_MODEL, get_vlm
 from observability import log_step, logger
 
 # 目前支持的扩展名；.doc 是旧版二进制格式，解析不了，引导用户另存为 .docx
-SUPPORTED_EXTENSIONS = (".pdf", ".docx")
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+SUPPORTED_EXTENSIONS = (".pdf", ".docx", *_IMAGE_EXTENSIONS)
 
 _IMAGE_PROMPT = """请用简体中文描述这张图片的内容，供音乐知识问答检索使用。要求：
 1. 若图中含文字（标题、歌词、乐谱记号、表格、说明文字），请逐条转写出来；
@@ -71,10 +76,13 @@ def parse_document(filename: str, content: bytes) -> list[ParsedBlock]:
         return _parse_pdf(content)
     if suffix == ".docx":
         return _parse_docx(content)
+    if suffix in _IMAGE_EXTENSIONS:
+        return _parse_image(content)
     if suffix == ".doc":
         raise UnsupportedFormatError("不支持旧版 .doc，请用 Word 另存为 .docx 后再上传")
     raise UnsupportedFormatError(
-        f"不支持的文件格式 {suffix or '(无扩展名)'}，目前仅支持 .pdf / .docx"
+        f"不支持的文件格式 {suffix or '(无扩展名)'}，"
+        f"目前仅支持 {' / '.join(SUPPORTED_EXTENSIONS)}"
     )
 
 
@@ -85,13 +93,13 @@ def blocks_to_text(blocks: list[ParsedBlock]) -> str:
         if block.kind == "text":
             parts.append(block.text)
             continue
-        where = f"第 {block.page} 页" if block.page else "文中"
+        where = f"第 {block.page} 页" if block.page else (block.source or "文中")
         parts.append(f"【图片内容（{where}）】{block.text}")
     return "\n\n".join(part for part in parts if part and part.strip())
 
 
 class _ImagePipeline:
-    """图片过滤 / 去重 / 描述 / 落盘，PDF 与 DOCX 共用。
+    """图片过滤 / 去重 / 描述 / 落盘，PDF、DOCX 与独立图片共用。
 
     - `_cache`：MD5 → 描述，落盘持久化，跨请求复用；
     - `_seen`：本次解析内已出现过的 MD5，同一张图重复出现不再产出新块。
@@ -101,8 +109,15 @@ class _ImagePipeline:
         self._cache = _load_cache()
         self._seen: set[str] = set()
 
-    def build(self, data: bytes, page: int | None, width: int, height: int) -> ParsedBlock | None:
-        if min(width, height) < IMAGE_MIN_SIZE:
+    def build(
+        self,
+        data: bytes,
+        page: int | None,
+        width: int,
+        height: int,
+        enforce_min_size: bool = True,
+    ) -> ParsedBlock | None:
+        if enforce_min_size and min(width, height) < IMAGE_MIN_SIZE:
             logger.info(
                 "image.skip",
                 extra={"fields": {"reason": "too_small", "width": width, "height": height}},
@@ -212,6 +227,29 @@ def _image_size(data: bytes) -> tuple[int, int] | None:
             return image.size
     except Exception:
         return None
+
+
+def _parse_image(content: bytes) -> list[ParsedBlock]:
+    """单独上传的一张图片：直接走图片管线，产出唯一一个 image 块。
+
+    与文档内嵌图的唯一差异是关掉尺寸过滤：那个过滤本意是滤掉 PDF / DOCX 里的
+    logo、页码装饰，而用户显式上传一张图是明确意图，再小也该交给 VLM 读。
+    """
+    size = _image_size(content)
+    if size is None:
+        raise UnsupportedFormatError("图片无法解码，请确认文件未损坏，且为 png/jpg/jpeg/gif/webp")
+
+    block = _ImagePipeline().build(
+        content, None, size[0], size[1], enforce_min_size=False
+    )
+    if block is None:
+        return []
+    block.source = "上传图片"
+    logger.info(
+        "image.standalone",
+        extra={"fields": {"width": size[0], "height": size[1], "bytes": len(content)}},
+    )
+    return [block]
 
 
 def _describe_with_vlm(data: bytes) -> str | None:

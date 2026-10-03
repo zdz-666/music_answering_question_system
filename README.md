@@ -15,7 +15,8 @@
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%。
 - **自反思过滤（Self-Reflection）**：在生成答案前，先由 LLM 从知识库/网络结果中剔除无关信息。
 - **多轮对话 + 三层记忆**：会话落盘在 SQLite（多 worker 共享、重启不丢），并在此基础上分三层记忆——**工作记忆**（最近 4 条消息 + 超过阈值后由 LLM 压缩出的滚动摘要）、**情景记忆**（同一 `user_id` 的跨会话历史问答，Chroma 按语义相似度检索）、**用户画像**（从对话中抽取的长期偏好与实体，Chroma 存储）。
-- **文件问答**：上传 `.pdf` / `.docx`，同时解析正文与内嵌图片——图片由视觉模型（VLM）
+- **文件问答**：上传 `.pdf` / `.docx`，或直接上传一张图片（`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`）
+  单独提问。文档会同时解析正文与内嵌图片——图片由视觉模型（VLM）
   转成中文描述后一起参与问答，扫描页（无文字层）自动整页渲染识别。
 - **知识库动态写入**：可在前端直接录入「个人信息 / 音乐理解 / 歌单」三类私人数据。
 - **离线评测**：内置 BLEU、ROUGE 与 LLM 忠诚度打分脚本（`llm_ev.py`），以及在 RGB 中文基准
@@ -47,7 +48,7 @@ bishe/
 ├── rag.py                  # RAG 主链路：查询重写、检索、自反思、答案生成
 ├── collection_router.py    # LLM 结构化输出做集合路由（含独立测试入口）
 ├── retrieval_planner.py    # LLM 结构化输出做检索决策：通道规划 + 信息是否充分
-├── document_loader.py      # 上传文档解析：PDF/DOCX 正文与内嵌图片、VLM 图片描述、描述缓存
+├── document_loader.py      # 上传解析：PDF/DOCX 正文与内嵌图、独立图片、VLM 图片描述、描述缓存
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
 ├── fixed_chunk.py          # 固定长度 + 重叠的等步长切分（FixedChunker），用于对比切分方式
@@ -168,7 +169,7 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 | POST | `/api/chat` | 发送消息，返回答案与 `session_id` |
 | GET | `/api/chat/history/{session_id}` | 查询会话历史（`number` 可选，默认 20） |
 | DELETE | `/api/chat/history/{session_id}` | 清空指定会话历史 |
-| POST | `/api/upload` | 上传 `.pdf` / `.docx` 文件并提问（含图片描述），其它格式返回 400 |
+| POST | `/api/upload` | 上传 `.pdf` / `.docx` / 图片（`.png` `.jpg` `.jpeg` `.gif` `.webp`）并提问（含图片描述），其它格式返回 400 |
 | POST | `/api/knowledge/self-introduction` | 写入个人信息 |
 | POST | `/api/knowledge/music-analysis` | 写入音乐理解 |
 | POST | `/api/knowledge/music-list` | 写入歌单 |
@@ -209,7 +210,7 @@ cp .env.example .env    # 然后填写 .env
 `RERANK_TIMEOUT` / `WEB_SEARCH_TIMEOUT` / `HTTP_RETRIES`（外部调用的超时秒数与重试次数）、
 `MAX_SUPPLEMENT_ROUNDS`（检索不足时最多追加几轮补充检索，默认 2，设 0 关闭）、
 `VLM_MODEL` / `VLM_TIMEOUT`（上传文档的图片描述模型与超时，留空则不生成图片描述）、
-`IMAGE_MIN_SIZE`（小于该像素的图片直接丢弃，默认 100）、`UPLOAD_IMAGE_DIR`（抽出的图片与描述缓存目录）、
+`IMAGE_MIN_SIZE`（**文档内嵌图**小于该像素直接丢弃，默认 100；用户单独上传的图片不受此限制）、`UPLOAD_IMAGE_DIR`（抽出的图片与描述缓存目录）、
 `LOG_LEVEL` / `TRACE_TEXT_LIMIT`（日志级别与链路追踪里每段输入输出的预览字符上限）。
 
 业务侧统一通过 `config.get_chat_model()`、`config.get_embeddings()`、`config.get_vlm()` 取实例，

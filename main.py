@@ -141,8 +141,8 @@ async def upload_file(
 ):
     content = await file.read()
 
-    # 解析在 document_loader 里分发：PDF（PyMuPDF）/ DOCX（python-docx），
-    # 图片会被抽出来交给 VLM 转成中文描述，一起拼进 file_content。
+    # 解析在 document_loader 里分发：PDF（PyMuPDF）/ DOCX（python-docx）/ 独立图片，
+    # 文档内嵌图与独立图片都会交给 VLM 转成中文描述，一起拼进 file_content。
     # 读文件与逐张调 VLM 都是同步阻塞的，必须下沉线程池。
     with log_step(
         "document.parse",

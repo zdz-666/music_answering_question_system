@@ -475,7 +475,7 @@ function App() {
                     ref={fileInputRef}
                     onChange={handleFileSelect}
                     className="file-input"
-                    accept=".pdf,.docx"
+                    accept=".pdf,.docx,.png,.jpg,.jpeg,.gif,.webp"
                   />
                   {selectedFile && (
                     <div className="selected-file">
