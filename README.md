@@ -146,14 +146,14 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 没有 Redis 时 `tasks.submit()` 返回 `None`，`/api/upload` 就地把同一套流程跑完，
 返回 `200 {status:"done", answer}` —— 队列是可选设施，不能因为没装 Redis 就让上传不可用。
 
-分块策略见 [dynamic_chunk.py](file:///d:/bishe/dynamic_chunk.py)：先按中英文标点切句，逐句向量化，
+分块策略见 [dynamic_chunk.py]：先按中英文标点切句，逐句向量化，
 相邻句余弦相似度低于 `0.7` 处切分，再按 `max_chunk_size` 强制截断并支持重叠。
 另有一种不做语义判断、按固定长度等步长（可带重叠）切分的 [fixed_chunk.py](file:///d:/bishe/fixed_chunk.py)，
 两者接口一致，评测时可切换以对比切分方式的影响。
 
 ### 会话存储（Redis）
 
-实现在 [session_store.py](file:///d:/bishe/session_store.py)。会话原先落在本地 SQLite 文件，
+实现在 [session_store.py]。会话原先落在本地 SQLite 文件，
 换成 Redis 之后除了继续满足「多 worker 共享、进程重启不丢」，还多了一层：API 进程与 worker 进程
 不必再共享同一个文件系统，会话与记忆同源，过期、容量、备份只有一套策略。
 
@@ -242,10 +242,10 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 | ③ | 单集合的「混合检索 + 重排」结果 | 集合名 + 集合版本 + 改写后的查询 + k | 1 小时 | 知识库写入时集合版本 +1，旧键立刻失联 |
 | ④ | 最终答案 | 问题摘要 | 5 分钟 | TTL |
 
-- 嵌入缓存包在 `config.get_embeddings()` 里（[config.py](file:///d:/bishe/config.py#L142-L159)），
+- 嵌入缓存包在 `config.get_embeddings()` 里（[config.py]），
   一次覆盖 Chroma 检索、分块、记忆写入全部调用方。`embed_documents` 不走缓存 —— 建库时每段文本都不相同，
   缓存只白占内存不省时间。
-- ④ 只在**没有历史、没有长期记忆、没有上传文件**时才启用（[rag.py](file:///d:/bishe/rag.py#L582-L598)）：
+- ④ 只在**没有历史、没有长期记忆、没有上传文件**时才启用（[rag.py]）：
   其余情况下同一个问题在不同会话、不同画像下答案本来就不同，拿问题当键会把 A 会话的答案喂给 B 会话。
 - 键统一带 `REDIS_KEY_PREFIX`（默认 `musicrag:v1`），改版本号即可让旧格式缓存整体作废。
 - 失效用**版本号**而不是 `SCAN` 删键：集合级版本号自增后旧键再也拼不出来，剩下的靠 TTL 自然过期，
@@ -259,7 +259,7 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 
 ### 接口限流
 
-实现在 [ratelimit.py](file:///d:/bishe/ratelimit.py)，复用缓存那一份 Redis 连接配置。
+实现在 [ratelimit.py]，复用缓存那一份 Redis 连接配置。
 
 | 接口 | 容量（可突发次数） | 补充速率 | 含义 |
 | --- | --- | --- | --- |
@@ -285,7 +285,7 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 
 ### 异步上传任务
 
-实现在 [tasks.py](file:///d:/bishe/tasks.py)（队列原语）与 [worker.py](file:///d:/bishe/worker.py)（消费者）。
+实现在 [tasks.py]（队列原语）与 [worker.py]（消费者）。
 
 - **为什么要排队**：一次上传要先用 PyMuPDF/DOCX 解析正文，再逐张把内嵌图交给 VLM 出描述，
   然后才走完整的 RAG 链路。几十张图的 PDF 能跑几分钟，同步处理意味着这个 HTTP 连接
@@ -353,10 +353,10 @@ pip install fastapi uvicorn langchain langchain-openai langchain-chroma langchai
 cp .env.example .env    # 然后填写 .env
 ```
 
-`.env` 已被 [.gitignore](file:///d:/bishe/.gitignore) 排除，密钥不会进入 git。
-[config.py](file:///d:/bishe/config.py) 只保存变量名与安全的默认值，不含任何真实密钥。
+`.env` 已被 [.gitignore]排除，密钥不会进入 git。
+[config.py]只保存变量名与安全的默认值，不含任何真实密钥。
 
-需要填写的变量见 [.env.example](file:///d:/bishe/.env.example)：`OPENAI_API_KEY` / `OPENAI_BASE_URL` /
+需要填写的变量见 [.env.example]：`OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 `LLM_MODEL` / `EMBEDDING_MODEL`（对话与向量模型，OpenAI 兼容接口）、`TAVILY_API_KEY`（联网搜索）、
 `RERANK_API_KEY`（重排序）、`CHROMA_PERSIST_DIR`（知识库向量库落盘目录，默认 `./chroma_db`）、
 `RERANK_TIMEOUT` / `WEB_SEARCH_TIMEOUT` / `HTTP_RETRIES`（外部调用的超时秒数与重试次数）、
@@ -377,7 +377,7 @@ cp .env.example .env    # 然后填写 .env
 
 ### 3. 初始化知识库集合
 
-将语料写入 `self_data/*.txt`，按需调用 [data_storage.py](file:///d:/bishe/data_storage.py) 的
+将语料写入 `self_data/*.txt`，按需调用 [data_storage.py]的
 `collection_create(url, collection_name)` 创建 Chroma 集合；集合名固定为
 `self_introduction`、`music_analysis`、`music_list` 三个，与路由逻辑对应。
 删除集合用 `drop_collection(collection_name)`。
@@ -418,11 +418,11 @@ docker tag docker.m.daocloud.io/library/redis:8-alpine redis:8-alpine
 
 除会话与记忆外，其余三块仍是可选的降级行为：
 
-- 缓存：[cache.py](file:///d:/bishe/cache.py) 的 `get_client()` 在拿不到连接时返回 `None`，
+- 缓存：[cache.py] 的 `get_client()` 在拿不到连接时返回 `None`，
   所有缓存读写退化成空操作，链路照常跑，只是每次都重新算。
-- 限流：[ratelimit.py](file:///d:/bishe/ratelimit.py) 在拿不到连接时直接放行；
+- 限流：[ratelimit.py]在拿不到连接时直接放行；
   也可以用 `RATE_LIMIT_ENABLED=false` 显式关掉。
-- 任务队列：[tasks.py](file:///d:/bishe/tasks.py) 的 `submit()` 返回 `None` 时，
+- 任务队列：[tasks.py]的 `submit()` 返回 `None` 时，
   `/api/upload` 退回同步处理，前端直接拿到答案（不再需要 worker 进程）。
 
 > 换嵌入模型（`EMBEDDING_MODEL`）后，RediSearch 索引的维度会与新向量不匹配，需要
