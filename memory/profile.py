@@ -1,12 +1,14 @@
-"""第三层记忆：用户画像（长期偏好与实体），同样用 Chroma 存储。
+"""第三层记忆：用户画像（长期偏好与实体），同样存在 Redis 的向量索引里。
 
 每一轮对话结束后由 LLM 抽取"长期稳定"的信息（身份/领域、音乐风格与歌手偏好、
-乐器、长期目标等），一条事实一条文档。临时信息（本次具体问题、一次性请求、寒暄）
+乐器、长期目标等），一条事实一条记忆。临时信息（本次具体问题、一次性请求、寒暄）
 不抽取。
 
 抽取用 with_structured_output 约束成列表，失败时 fail-open 为空列表，不影响主链路。
-文档 id = md5(user_id + 归一化后的事实文本)，同一事实重复出现会 upsert 覆盖而不是
-新增，天然去重。
+文档 id = md5(user_id + 归一化后的事实文本)，同一事实重复出现会覆盖而不是新增，
+天然去重。
+
+画像只按语义相似度取，不叠加时间近因性：偏好这类信息不因为"久没提"就变得不重要。
 """
 
 import hashlib
@@ -16,9 +18,10 @@ from typing import List
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
-from config import PROFILE_COLLECTION, PROFILE_TOP_K, get_chat_model
-from data_storage import load_vector_store
+from config import PROFILE_COLLECTION, PROFILE_TOP_K, get_chat_model, get_embeddings
 from observability import log_step, logger
+
+from . import ft_index
 
 EXTRACT_PROMPT = """你负责维护用户画像。请从下面这一轮对话中抽取关于该用户的【长期稳定】信息。
 
@@ -68,28 +71,40 @@ def extract_and_store(user_id: str, question: str, answer: str) -> int:
         span.output = result.facts
 
     now = datetime.now().isoformat()
-    docs, ids = [], []
+    embeddings = get_embeddings()
+    written = 0
     for fact in result.facts:
         # 归一化空白，让措辞相同的事实落到同一个 id
         fact = " ".join((fact or "").split())
         if not fact:
             continue
-        ids.append(_doc_id(user_id, fact))
-        docs.append(
-            Document(page_content=fact, metadata={"user_id": user_id, "timestamp": now})
+        ft_index.upsert(
+            PROFILE_COLLECTION,
+            doc_id=_doc_id(user_id, fact),
+            vector=embeddings.embed_query(fact),
+            text=fact,
+            user_id=user_id,
+            timestamp=now,
         )
-
-    if not docs:
-        return 0
-
-    load_vector_store(PROFILE_COLLECTION).add_documents(docs, ids=ids)
-    return len(docs)
+        written += 1
+    return written
 
 
 def search(user_id: str, question: str, k: int = PROFILE_TOP_K) -> list[Document]:
     """按语义相似度取该用户的画像事实。"""
     if not user_id:
         return []
-    return load_vector_store(PROFILE_COLLECTION).similarity_search(
-        question, k=k, filter={"user_id": user_id}
+
+    hits = ft_index.search(
+        PROFILE_COLLECTION,
+        vector=get_embeddings().embed_query(question),
+        user_id=user_id,
+        k=k,
     )
+    return [
+        Document(
+            page_content=hit["text"],
+            metadata={"user_id": user_id, "timestamp": hit["ts"]},
+        )
+        for hit in hits
+    ]

@@ -5,6 +5,9 @@
 2. 情景记忆（memory.episodic）—— 同一 user_id 的跨会话历史问答，按语义相似度检索；
 3. 用户画像（memory.profile）—— 从对话里抽取的长期偏好与实体，按语义相似度检索。
 
+三层的落点都在 Redis：工作记忆是 list + hash，后两层是 RediSearch 的向量索引
+（统一见 memory/ft_index.py）。放在同一个实例里，过期、容量与备份只有一套策略。
+
 调用方（main.py）只需要两个函数：
 - build_context：回答之前取记忆，拼成一段文本交给 rag.get_result；
 - after_turn：一轮结束后写记忆（压缩工作记忆 + 写情景记忆 + 更新画像）。

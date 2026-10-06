@@ -1,7 +1,8 @@
-"""第二层记忆：情景记忆（跨会话的历史问答），用 Chroma 存储。
+"""第二层记忆：情景记忆（跨会话的历史问答），存在 Redis 的向量索引里。
 
-每一轮对话写成一条文档，metadata 带 user_id / session_id / timestamp，
-检索时按 user_id 过滤后再用问题做语义相似度匹配，"跨会话"= 同一 user_id 的多个会话。
+每一轮对话写成一条记忆，带 user_id / session_id / timestamp 三个字段，
+检索时先按 user_id 过滤、再用问题做语义相似度匹配，
+"跨会话"= 同一 user_id 的多个会话。
 
 排序不只看语义相似度，还叠加时间近因性 —— 同样相关时，刚聊过的内容优先于很久以前的：
 
@@ -15,11 +16,12 @@
 本模型余弦带宽很窄，不归一化的话 [0,1] 的近因性会完全压倒相似度。
 
 三个实现细节值得留意：
-- 文档 id 用内容的 md5（确定性 id），Chroma 底层的 add 是 upsert，
-  因此重放/重试天然幂等，不需要先查重再写。
-- 过滤条件只写单键 {"user_id": ...}。chromadb 要求 where 顶层恰好一个操作符
-  （多条件必须套 $and），且 $ne 的实现会让"缺少该字段"的记录也被返回，
-  所以这里不用 $ne 排除当前会话，而是多取几条后在 Python 里剔除。
+- 文档 id 用内容的 md5（确定性 id），写入是覆盖式的，因此重放/重试天然幂等，
+  不需要先查重再写。
+- 过滤与排除都交给 RediSearch 在服务端完成（TAG 匹配 + TAG 取反），
+  不像 Chroma 那样受 where 语法限制而只能「多取几条再在 Python 里剔除」。
+- 写入用的向量直接取 embed_query，与检索侧同一个口径；嵌入对同一文本是纯函数，
+  这样还能吃上 config.get_embeddings() 自带的查询缓存。
 """
 
 import hashlib
@@ -33,9 +35,11 @@ from config import (
     EPISODIC_DECAY_FACTOR,
     EPISODIC_RECENCY_WEIGHT,
     EPISODIC_TOP_K,
+    get_embeddings,
 )
-from data_storage import load_vector_store
 from observability import logger
+
+from . import ft_index
 
 
 def _doc_id(user_id: str, session_id: str, question: str, answer: str) -> str:
@@ -43,27 +47,30 @@ def _doc_id(user_id: str, session_id: str, question: str, answer: str) -> str:
     return hashlib.md5(raw).hexdigest()
 
 
+def _document(hit: dict, user_id: str) -> Document:
+    return Document(
+        page_content=hit["text"],
+        metadata={
+            "user_id": user_id,
+            # 用原始的 session_id（不是索引里做过滤用的摘要），调用方回传也认得
+            "session_id": hit["session"],
+            "timestamp": hit["ts"],
+        },
+    )
+
+
 def _relevance(distance: float) -> float:
-    """把 Chroma 的距离折成绝对余弦相似度（0~1）。
+    """把 RediSearch 的 COSINE 距离折成绝对余弦相似度（0~1）。
 
-    本集合 hnsw.space = l2，且 Chroma 在 l2 空间返回的是**平方**欧氏距离
-    （实测 d=1.4822 与手算 ‖q-v‖²=1.4849 一致，而非 1.2186 的普通距离）。
-    本项目嵌入为 4096 维单位向量（实测 norm = 1.000000），于是
-
-        ‖q-v‖² = 2 - 2·cos(q, v)   ⟹   cos(q, v) = 1 - d/2
-
-    即 1 - d/2 恰为余弦相似度。负相关截到 0，避免把近因性那一项抵消掉。
-
-    注意不要照搬 langchain 的 _euclidean_relevance_score_fn(1 - d/√2)：它假设 d 是
-    普通 L2 距离，套在平方距离上会恒为负、把所有候选压成 0（相似度项失效）。
-    也不直接调 similarity_search_with_relevance_scores —— 它同样基于该错误口径，
-    且对越界分数只发 warning，warning 里带整批文档、每次调用重复打印，反而污染日志。
+    索引是按 DISTANCE_METRIC COSINE 建的，KNN 给出的 score 就是 1 - cos(q, v)，
+    所以 1 - score 恰为余弦相似度（实测：向量完全相同得 0，正交得 1）。
+    负相关（距离 > 1）截到 0，避免把近因性那一项抵消掉。
 
     返回值是**绝对**余弦，搜索时还会在候选集内再做一次 min-max —— 本模型对长短
     文本的余弦值被压在很窄的带里（实测"同主题"0.25 与"不同主题"0.20 只差 0.055），
     绝对量纲下 0.7*0.055 = 0.039 的区分度会被 0.3*1.0 = 0.3 的近因性完全淹没。
     """
-    return max(0.0, min(1.0, 1.0 - distance / 2.0))
+    return max(0.0, min(1.0, 1.0 - distance))
 
 
 def _recency_score(timestamp: str | None, now: datetime) -> float:
@@ -95,16 +102,15 @@ def add_turn(
     if not user_id:
         return
 
-    doc = Document(
-        page_content=f"问：{question}\n答：{answer}",
-        metadata={
-            "user_id": user_id,
-            "session_id": session_id,
-            "timestamp": timestamp or datetime.now().isoformat(),
-        },
-    )
-    load_vector_store(EPISODIC_COLLECTION).add_documents(
-        [doc], ids=[_doc_id(user_id, session_id, question, answer)]
+    text = f"问：{question}\n答：{answer}"
+    ft_index.upsert(
+        EPISODIC_COLLECTION,
+        doc_id=_doc_id(user_id, session_id, question, answer),
+        vector=get_embeddings().embed_query(text),
+        text=text,
+        user_id=user_id,
+        timestamp=timestamp or datetime.now().isoformat(),
+        session_id=session_id,
     )
 
 
@@ -123,21 +129,19 @@ def search(
         return []
 
     fetch_k = max(k * 4, k + 5)
-    scored = load_vector_store(EPISODIC_COLLECTION).similarity_search_with_score(
-        question,
+    hits = ft_index.search(
+        EPISODIC_COLLECTION,
+        vector=get_embeddings().embed_query(question),
+        user_id=user_id,
         k=fetch_k,
-        filter={"user_id": user_id},
+        exclude_session_id=exclude_session_id,
     )
 
     now = datetime.now()
-    candidates = []
-    for doc, distance in scored:
-        if doc.metadata.get("session_id") == exclude_session_id:
-            continue
-        candidates.append(
-            (doc, _relevance(distance), _recency_score(doc.metadata.get("timestamp"), now))
-        )
-
+    candidates = [
+        (_document(hit, user_id), _relevance(hit["distance"]), _recency_score(hit["ts"], now))
+        for hit in hits
+    ]
     if not candidates:
         return []
 

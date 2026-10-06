@@ -1,31 +1,49 @@
-"""会话持久化：用 SQLite 文件替代原先 main.py 里的进程内字典。
+"""会话持久化：用 Redis 承载当前会话的最近消息与滚动摘要。
 
-原来 `sessions = {}` 有两个问题：
-- `uvicorn --workers 2` 时每个 worker 各存一份，同一会话被路由到另一个 worker 就读不到历史；
-- 进程重启即丢。
+原先用本地 SQLite 文件，是为了解决「uvicorn --workers 2 时各进程各存一份、进程重启即丢」。
+换成 Redis 后这两点依然满足，并且多了一层：API 进程与 worker 进程不再需要共享同一个
+文件系统，Redis 是真正的共享存储；会话与记忆（memory/episodic、memory/profile）同源，
+过期、容量、备份只有一套策略。
 
-改用本地 SQLite 文件：跨进程共享、重启不丢，且不需要额外起服务（与嵌入式 Chroma 一致）。
-多进程并发写靠 WAL + busy_timeout 兜住：WAL 让读写可以并存，busy_timeout 让写冲突时等待
-而不是直接抛 database is locked。
+定位：会话是**正确性依赖**，不是缓存。缓存/限流/队列拿不到 Redis 可以降级，
+会话不行 —— 降级只会把「读不到历史」伪装成「这是一段新对话」，属于静默的数据错误。
+因此这里取连接用 cache.require_client()，拿不到就抛错。
 
-这些函数保持同步实现：单次操作就是一次本地文件读写，复用连接后在亚毫秒级，与会话链路里动辄数秒的
-LLM 调用不是一个量级，没必要再下沉线程池。
+键设计（前缀复用 cache.key()，与缓存同一版本号）：
 
-这里是三层记忆里的第一层（工作记忆）的落点：
-- messages 表保存当前会话的最近消息，注入 prompt 的是最近 HISTORY_WINDOW 条；
-- session_summaries 表保存一段滚动摘要，消息条数超过 COMPRESS_TRIGGER 时由
-  memory/working.py 把最旧一批消息合并进摘要并删除，压缩走「claim → LLM → commit」
-  两阶段，compression_claims 表保证多 worker 下同一会话不会被重复压缩。
+    sess:{id}:meta   HASH    created_at / updated_at / next_id
+    sess:{id}:msgs   LIST    元素 = JSON {"id", "role", "content", "timestamp"}
+    sess:{id}:sum    STRING  滚动摘要
+    sess:{id}:claim  STRING  压缩认领（SET NX PX，值 = 认领时刻）
+
+与 SQLite 版的语义对应（函数签名与行为全部保持一致，调用方零改动）：
+
+    sessions 表的存在性        → meta 键是否存在
+    messages 的自增 id         → meta 里的 next_id（HINCRBY）
+    DELETE ... WHERE id <= max → 从左端弹出所有 id <= max_id 的元素
+    compression_claims UPSERT  → SET key val NX PX（抢占成功即拿到）
+    ON DELETE CASCADE          → 显式 DEL 各个键
+
+这里是三层记忆里第一层（工作记忆）的落点：
+- msgs 保存当前会话的最近消息，注入 prompt 的是最近 HISTORY_WINDOW 条；
+- sum 保存一段滚动摘要，消息条数超过 COMPRESS_TRIGGER 时由 memory/working.py
+  把最旧一批消息合并进摘要并删掉，压缩走「claim → LLM → commit」两阶段，
+  claim 键保证多 worker 下同一会话不会被重复压缩。
+
+Lua 的两处必要性：
+- 追加消息要「取号 → 入队 → 裁剪 → 续期」四步，拆开会有两个 worker 拿到同一号、
+  或消息顺序与 id 顺序不一致的竞态；
+- 提交压缩要「写摘要 → 删消息 → 释放认领」原子完成，否则会出现摘要更新了但消息没删，
+  或消息删了但摘要没写的中间态。
 """
 
-import sqlite3
-import threading
+import json
 import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime
 
-from config import SESSION_DB_PATH
+import cache
+from config import SESSION_TTL_SECONDS
 from models import ChatMessage
 from observability import logger
 
@@ -35,106 +53,146 @@ COMPRESS_TRIGGER = HISTORY_WINDOW + COMPRESS_BATCH  # 超过这个条数就触�
 # 消息条数的兜底硬上限：正常路径永远不该触发（压缩会先把消息降回 HISTORY_WINDOW），
 # 一旦触发说明压缩流程失效，这里保证消息不会无界增长，同时打 warning 暴露问题。
 MAX_MESSAGES_HARD = 200
-CLAIM_STALE_SECONDS = 60.0  # 压缩认领的过期秒数，兜住压缩过程中进程崩溃
-BUSY_TIMEOUT = 5.0  # 写锁被其它 worker 占用时的最长等待秒数
+CLAIM_STALE_SECONDS = 60  # 压缩认领的过期秒数，兜住压缩过程中进程崩溃
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
-);
+_PURPOSE = "会话存储"
 
-CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    role       TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    timestamp  TEXT
-);
+# 追加一条消息：取号 + 入队 + 按硬上限裁剪 + 续期。返回被裁掉的条数。
+# 消息 JSON 在 Lua 里用 cjson 拼，就是为了让 id 与入队顺序在同一次原子执行里确定。
+_ADD_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    redis.call('HSET', KEYS[1], 'created_at', ARGV[1], 'next_id', 0)
+end
+local id = redis.call('HINCRBY', KEYS[1], 'next_id', 1)
+redis.call('HSET', KEYS[1], 'updated_at', ARGV[1])
+redis.call('RPUSH', KEYS[2], cjson.encode({
+    id = id, role = ARGV[2], content = ARGV[3], timestamp = ARGV[4]
+}))
 
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+local trimmed = 0
+local total = redis.call('LLEN', KEYS[2])
+local hard = tonumber(ARGV[6])
+if total > hard then
+    trimmed = total - hard
+    redis.call('LTRIM', KEYS[2], trimmed, -1)
+end
 
-CREATE TABLE IF NOT EXISTS session_summaries (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
-    summary    TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
--- 压缩认领标记：同一会话同一时刻只允许一个 worker 在压缩
-CREATE TABLE IF NOT EXISTS compression_claims (
-    session_id TEXT PRIMARY KEY,
-    claimed_at REAL NOT NULL
-);
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+redis.call('EXPIRE', KEYS[2], ARGV[5])
+redis.call('EXPIRE', KEYS[3], ARGV[5])
+return trimmed
 """
 
+# 提交压缩：弹出所有被摘要覆盖的消息 + 写摘要 + 释放认领，一次原子完成。
+# 用「弹出左端 id <= max_id 的元素」而不是「删前 N 条」：max_id 是本次读到的批次里
+# 最大的 id，压缩期间新插入的消息 id 更大，无论它是否已经排到前面都不会被误删。
+_COMMIT_LUA = """
+local max_id = tonumber(ARGV[1])
+while true do
+    local head = redis.call('LINDEX', KEYS[2], 0)
+    if not head then break end
+    local ok, item = pcall(cjson.decode, head)
+    if not ok or tonumber(item['id']) == nil or tonumber(item['id']) > max_id then break end
+    redis.call('LPOP', KEYS[2])
+end
 
-_local = threading.local()
+redis.call('SET', KEYS[3], ARGV[2], 'EX', ARGV[3])
+redis.call('DEL', KEYS[4])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return 1
+"""
+
+_scripts: dict = {}
 
 
-def _conn() -> sqlite3.Connection:
-    """按线程复用一个长连接。
+def _script(client, name: str, source: str):
+    """按名字缓存已注册的脚本对象；redis-py 内部走 EVALSHA，未命中会自动 EVAL。
 
-    两点原因：
-    - sqlite3 的连接不能跨线程共享，而 FastAPI 会在多个工作线程里调用这里，所以按线程缓存；
-    - 反复开关连接时，最后一个连接关闭会触发 WAL checkpoint 并删掉 -wal/-shm 文件，
-      Windows 上这一下实测要 35ms 左右，成为单次操作的主要开销。连接复用后写入约 1.4ms、
-      查询约 0.03ms。
-
-    WAL 下连接长开不会阻塞其它进程写入，SQLite 也会按 wal_autocheckpoint 自动回收 -wal，
-    不需要手工干预。
+    客户端实例一旦连上就不会再变（见 cache.get_client），所以脚本可以放心复用。
     """
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        conn = sqlite3.connect(SESSION_DB_PATH, timeout=BUSY_TIMEOUT)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        _local.conn = conn
-    return conn
+    script = _scripts.get(name)
+    if script is None:
+        script = client.register_script(source)
+        _scripts[name] = script
+    return script
 
 
-@contextmanager
-def _connect():
-    """借出当前线程的连接：正常结束提交，出错回滚（两者都不关闭连接）。"""
-    conn = _conn()
-    try:
-        yield conn
-    except Exception:
-        conn.rollback()
-        raise
-    conn.commit()
+def _client():
+    return cache.require_client(_PURPOSE)
+
+
+def _key(session_id: str, suffix: str) -> str:
+    return cache.key("sess", session_id, suffix)
+
+
+def _touch(client, session_id: str) -> None:
+    """把会话的三个键一起续到 SESSION_TTL_SECONDS，并成一次往返。"""
+    pipe = client.pipeline(transaction=False)
+    for suffix in ("meta", "msgs", "sum"):
+        pipe.expire(_key(session_id, suffix), SESSION_TTL_SECONDS)
+    pipe.execute()
+
+
+def _decode(raw) -> str:
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+def _item(raw) -> dict:
+    """列表元素（JSON 文本）→ {"id", "role", "content", "timestamp"}。"""
+    data = json.loads(_decode(raw))
+    return {
+        "id": data.get("id"),
+        "role": data.get("role"),
+        "content": data.get("content"),
+        "timestamp": data.get("timestamp"),
+    }
 
 
 def init_db() -> None:
-    """建表并切到 WAL。幂等，多个 worker 同时启动也安全。"""
-    with _connect() as conn:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.executescript(_SCHEMA)
+    """启动自检：确认 Redis 可访问。
+
+    取代原先的「建表 + 切 WAL」。幂等，每个 worker 启动时各跑一次。
+    连不上直接抛错，让问题在启动阶段暴露，而不是等第一个请求进来才发现。
+    """
+    client = _client()
+    try:
+        client.ping()
+    except Exception as exc:  # noqa: BLE001 - 启动自检要给出可读原因
+        raise RuntimeError(
+            f"会话存储无法连接 Redis：{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def new_session_id() -> str:
     """时间戳 + 随机后缀。
 
-    原先用 len(sessions) 当后缀，多 worker 下各进程各自计数，同一秒内会算出相同的 id；
+    用 len(sessions) 当后缀的话，多 worker 下各进程各自计数，同一秒内会算出相同的 id；
     换成随机后缀后不需要任何共享计数器。
     """
     return f"session_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
 
 def get_or_create_session(session_id: str | None) -> str:
-    """session_id 已存在就用它，否则新建一个并返回。"""
-    with _connect() as conn:
-        if session_id:
-            row = conn.execute(
-                "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-            ).fetchone()
-            if row:
-                return session_id
+    """session_id 已存在就用它，否则新建一个并返回。
 
-        session_id = new_session_id()
-        conn.execute(
-            "INSERT INTO sessions (session_id, created_at) VALUES (?, ?)",
-            (session_id, datetime.now().isoformat()),
-        )
+    取到已有会话时顺手续一次 TTL：每次对话开头都会调这里，于是「活跃会话不过期」。
+    """
+    client = _client()
+    if session_id and client.exists(_key(session_id, "meta")):
+        _touch(client, session_id)
+        return session_id
+
+    session_id = new_session_id()
+    now = datetime.now().isoformat()
+    pipe = client.pipeline(transaction=False)
+    pipe.hset(
+        _key(session_id, "meta"),
+        mapping={"created_at": now, "updated_at": now, "next_id": 0},
+    )
+    for suffix in ("meta", "msgs", "sum"):
+        pipe.expire(_key(session_id, suffix), SESSION_TTL_SECONDS)
+    pipe.execute()
     return session_id
 
 
@@ -144,53 +202,41 @@ def add_message(session_id: str, message: ChatMessage) -> None:
     正常的瘦身交给 memory/working.py 的摘要压缩（把最旧一批消息并入摘要后删除），
     这里只是最后一道防线：真触发了说明压缩没跑起来，打 warning 暴露。
     """
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (session_id, message.role, message.content, datetime.now().isoformat()),
-        )
-        cursor = conn.execute(
-            """
-            DELETE FROM messages
-             WHERE session_id = ?
-               AND id NOT IN (
-                   SELECT id FROM messages
-                    WHERE session_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-               )
-            """,
-            (session_id, session_id, MAX_MESSAGES_HARD),
-        )
-        trimmed = cursor.rowcount
+    client = _client()
+    trimmed = _script(client, "add", _ADD_LUA)(
+        keys=[
+            _key(session_id, "meta"),
+            _key(session_id, "msgs"),
+            _key(session_id, "sum"),
+        ],
+        args=[
+            datetime.now().isoformat(),
+            message.role,
+            message.content,
+            message.timestamp or datetime.now().isoformat(),
+            SESSION_TTL_SECONDS,
+            MAX_MESSAGES_HARD,
+        ],
+    )
 
-    if trimmed:
+    if int(trimmed or 0):
         logger.warning(
             "messages.hard_trim",
-            extra={"fields": {"session_id": session_id, "trimmed": trimmed}},
+            extra={"fields": {"session_id": session_id, "trimmed": int(trimmed)}},
         )
 
 
 def count_messages(session_id: str) -> int:
     """会话当前的消息条数，用于判断是否该做摘要压缩。"""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS total FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-    return int(row["total"])
+    return int(_client().llen(_key(session_id, "msgs")))
 
 
 def get_summary(session_id: str) -> str | None:
     """当前会话的滚动摘要；没有或为空时返回 None。"""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT summary FROM session_summaries WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-    if not row:
+    raw = _client().get(_key(session_id, "sum"))
+    if raw is None:
         return None
-    summary = (row["summary"] or "").strip()
+    summary = _decode(raw).strip()
     return summary or None
 
 
@@ -199,79 +245,53 @@ def list_oldest_messages(session_id: str, limit: int) -> list[dict]:
 
     带上 id 是为了压缩提交时能按 id 精确删除这一批（并发新插入的消息 id 更大，不受影响）。
     """
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, role, content FROM messages
-             WHERE session_id = ?
-             ORDER BY id ASC
-             LIMIT ?
-            """,
-            (session_id, limit),
-        ).fetchall()
-    return [
-        {"id": row["id"], "role": row["role"], "content": row["content"]}
-        for row in rows
-    ]
+    if limit <= 0:
+        # 注意别让 LRANGE 0 -1 变成「取全部」：limit<=0 就该是空批次
+        return []
+    raw = _client().lrange(_key(session_id, "msgs"), 0, limit - 1)
+    return [_item(item) for item in raw]
 
 
 def claim_compression(session_id: str) -> bool:
     """压缩两阶段的第一步：抢占该会话的压缩权。
 
-    整件事只用一条 UPSERT 完成，靠 rowcount 判断结果：插入成功（此前没认领）或被刷新的
-    过期认领都算抢占成功。DO UPDATE 上的 WHERE 让"未过期的认领"变成一次空操作
-    （changed=0），于是并发调用里只有一个能拿到 True。
-
-    不能写成"先 SELECT 再 INSERT"：WAL 下读快照与写入之间没有互斥，两个 worker
-    同时读到"没有认领"就会双双抢占成功（实测如此）。单条 UPSERT 由 SQLite 串行化写入，
-    第二个调用一定看到第一个的结果。
+    原先是 SQLite 上一条 UPSERT + rowcount 判断，这里用 SET NX PX 表达同一件事：
+    NX 保证「已有未过期认领」时抢占失败，于是并发调用里只有一个能拿到 True；
+    PX 让认领在 CLAIM_STALE_SECONDS 后自动失效，等价于原实现里「刷新过期认领」的分支，
+    进程压缩中途崩溃也不会把这个会话永远锁死。
     """
-    now = time.time()
-    with _connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO compression_claims (session_id, claimed_at) VALUES (?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET claimed_at = excluded.claimed_at
-             WHERE compression_claims.claimed_at < ?
-            """,
-            (session_id, now, now - CLAIM_STALE_SECONDS),
-        )
-        # rowcount：插入 1 / 刷新过期认领 1 / 命中未过期认领的 WHERE 而空操作 0
-        return cursor.rowcount == 1
+    client = _client()
+    acquired = client.set(
+        _key(session_id, "claim"),
+        str(time.time()),
+        nx=True,
+        px=CLAIM_STALE_SECONDS * 1000,
+    )
+    return bool(acquired)
 
 
 def release_compression(session_id: str) -> None:
     """压缩失败时释放认领：消息保留，下一轮再试。"""
-    with _connect() as conn:
-        conn.execute(
-            "DELETE FROM compression_claims WHERE session_id = ?", (session_id,)
-        )
+    _client().delete(_key(session_id, "claim"))
 
 
 def commit_compression(session_id: str, summary: str, max_id: int) -> None:
     """压缩两阶段的第二步：写回摘要 + 删除已被摘要覆盖的那批消息 + 释放认领。
 
-    三件事在同一个事务里完成，避免出现"摘要更新了但消息没删"或"消息删了但摘要没写"的中间态。
-    删除用 `id <= max_id`：max_id 是本次读到的批次里最大的 id，等价于删掉这一批，
+    三件事在同一个 Lua 脚本里原子完成，避免出现「摘要更新了但消息没删」或
+    「消息删了但摘要没写」的中间态。删除按 `id <= max_id` 而非「前 N 条」，
     压缩期间新插入的消息 id 更大，不会被误删。
     """
-    now = datetime.now().isoformat()
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO session_summaries (session_id, summary, updated_at) VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE
-                SET summary = excluded.summary, updated_at = excluded.updated_at
-            """,
-            (session_id, summary, now),
-        )
-        conn.execute(
-            "DELETE FROM messages WHERE session_id = ? AND id <= ?",
-            (session_id, max_id),
-        )
-        conn.execute(
-            "DELETE FROM compression_claims WHERE session_id = ?", (session_id,)
-        )
+    client = _client()
+    _script(client, "commit", _COMMIT_LUA)(
+        keys=[
+            _key(session_id, "meta"),
+            _key(session_id, "msgs"),
+            _key(session_id, "sum"),
+            _key(session_id, "claim"),
+        ],
+        args=[max_id, summary, SESSION_TTL_SECONDS],
+    )
 
 
 def get_history_str(session_id: str) -> str:
@@ -280,68 +300,49 @@ def get_history_str(session_id: str) -> str:
     摘要代表已被裁掉的那些轮次，最近几条代表刚刚发生的事，两者拼起来才是完整的工作记忆。
     """
     summary = get_summary(session_id)
-
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT role, content FROM messages
-             WHERE session_id = ?
-             ORDER BY id DESC
-             LIMIT ?
-            """,
-            (session_id, HISTORY_WINDOW),
-        ).fetchall()
+    raw = _client().lrange(_key(session_id, "msgs"), -HISTORY_WINDOW, -1)
 
     history = f"【此前对话摘要】{summary}\n" if summary else ""
-    for row in reversed(rows):  # 倒序取出，翻回时间正序
-        if row["role"] == "user":
-            history += f"用户: {row['content']}\n"
-        elif row["role"] == "assistant":
-            history += f"助手: {row['content']}\n"
+    for item in raw:  # LRANGE 从右端取，已是时间正序，无需再翻转
+        message = _item(item)
+        if message["role"] == "user":
+            history += f"用户: {message['content']}\n"
+        elif message["role"] == "assistant":
+            history += f"助手: {message['content']}\n"
     return history
 
 
 def list_messages(session_id: str, number: int) -> list[ChatMessage] | None:
     """最近 number 条消息；会话不存在时返回 None，由调用方转 404。"""
-    with _connect() as conn:
-        if not conn.execute(
-            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone():
-            return None
+    client = _client()
+    if not client.exists(_key(session_id, "meta")):
+        return None
 
-        rows = conn.execute(
-            """
-            SELECT role, content, timestamp FROM messages
-             WHERE session_id = ?
-             ORDER BY id DESC
-             LIMIT ?
-            """,
-            (session_id, number),
-        ).fetchall()
-
+    raw = client.lrange(_key(session_id, "msgs"), -number, -1)
     return [
-        ChatMessage(role=row["role"], content=row["content"], timestamp=row["timestamp"])
-        for row in reversed(rows)
+        ChatMessage(
+            role=item["role"],
+            content=item["content"],
+            timestamp=item["timestamp"],
+        )
+        for item in (_item(raw_item) for raw_item in raw)
     ]
 
 
 def clear_messages(session_id: str) -> bool:
     """清空消息与摘要；会话不存在返回 False。
 
-    保留会话行是有意的：原实现里 delete 之后会话仍然存在，再查历史会返回空列表而不是 404。
-    摘要必须一起清掉，否则"清空历史"之后助手仍然记得之前聊过什么。
+    保留 meta 是有意的：原实现里 delete 之后会话仍然存在，再查历史会返回空列表而不是 404。
+    摘要必须一起清掉，否则「清空历史」之后助手仍然记得之前聊过什么；
+    认领也一并清掉，否则残留的认领会让接下来 CLAIM_STALE_SECONDS 内的压缩被跳过。
     """
-    with _connect() as conn:
-        if not conn.execute(
-            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone():
-            return False
+    client = _client()
+    if not client.exists(_key(session_id, "meta")):
+        return False
 
-        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        conn.execute(
-            "DELETE FROM session_summaries WHERE session_id = ?", (session_id,)
-        )
-        conn.execute(
-            "DELETE FROM compression_claims WHERE session_id = ?", (session_id,)
-        )
+    client.delete(
+        _key(session_id, "msgs"),
+        _key(session_id, "sum"),
+        _key(session_id, "claim"),
+    )
     return True

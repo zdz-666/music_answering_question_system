@@ -1,13 +1,21 @@
+from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
+import cache
+import document_loader
+import memory
 from collection_router import get_router_collection
-from models import QueryRequest
+from models import ChatMessage, QueryRequest
 from dynamic_chunk import SemanticChunker
 from data_storage import (
     in_memory_similarity_search,
     load_vector_store,
     vector_similarity_search,
 )
+from session_store import add_message, get_history_str, get_or_create_session
 from config import (
+    CACHE_TTL_ANSWER,
+    CACHE_TTL_LLM,
+    CACHE_TTL_RETRIEVAL,
     HTTP_RETRIES,
     MAX_SUPPLEMENT_ROUNDS,
     RERANK_BASE_URL,
@@ -24,6 +32,7 @@ from observability import log_step, logger
 from retrieval_planner import judge_retrieval_sufficiency, plan_retrieval_channels
 import httpx
 import math
+from datetime import datetime
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -111,10 +120,19 @@ def query_rewriting(query: str):
 """
     rewriting_query = ChatPromptTemplate.from_template(prompt)
     messages = rewriting_query.format_messages(question=query)
-    with log_step("query_rewriting", input=query, query_len=len(query)) as span:
-        result = llm.invoke(messages)
-        span.output = result.content
-    return result.content
+
+    # 重写结果只由这条 query 决定，与历史、记忆无关，因此按 query 缓存是安全的；
+    # 一次请求里多集合轮询与补充检索会反复走到这里，命中率很高。
+    name = cache.key("rewrite", cache.digest(query))
+    cached = cache.get_json(name)
+    with log_step(
+        "query_rewriting", input=query, query_len=len(query), cached=cached is not None
+    ) as span:
+        if cached is None:
+            cached = llm.invoke(messages).content
+            cache.set_json(name, cached, CACHE_TTL_LLM)
+        span.output = cached
+    return cached
 
 
 def web_rewriting(query: str):
@@ -271,18 +289,63 @@ def route_collections(question: str) -> list:
     """由 LLM 判断这个问题该落到哪几个集合。
 
     与检索拆开是因为补充检索要复用首轮的集合名，不能每轮重跑一次路由。
+    路由同样只由 question 决定，所以按 question 缓存 —— 补充检索每轮都要问一次路由，
+    没有缓存的话同一个问题会被重复判断两三次。
     """
-    with log_step("collection_router", input=question) as span:
-        collection_list = get_router_collection(question)
-        span.output = collection_list
-    return collection_list
+    name = cache.key("route", cache.digest(question))
+    cached = cache.get_json(name)
+    with log_step(
+        "collection_router", input=question, cached=cached is not None
+    ) as span:
+        if cached is None:
+            cached = get_router_collection(question)
+            cache.set_json(name, cached, CACHE_TTL_LLM)
+        span.output = cached
+    return cached
+
+
+def _cached_vector_search(collection_name: str, query_change: str, k: int) -> list:
+    """单个集合的「混合检索 + 重排」结果（chunk 文本列表），按 集合版本 + 改写后的查询 缓存。
+
+    这一步是最贵的：一次 Chroma 稠密检索要算一次嵌入（已单独缓存），BM25 要把集合
+    全量文档读出来重建索引，重排还要一次跨网请求。缓存的唯一外部依赖是集合内容，
+    知识库写入时 bump_kb_version 会让旧键立刻失联，因此不会读到过期的检索结果。
+
+    rerank 返回的已经是 list[str]（它在开头就把 Document 拆成了 page_content），
+    所以这里直接缓字符串列表，不必再承载 Document 的元数据。
+    """
+    name = cache.key(
+        "search",
+        collection_name,
+        cache.kb_version(collection_name),
+        cache.digest(query_change, k),
+    )
+    cached = cache.get_json(name)
+
+    with log_step(
+        "vector_search",
+        input=query_change,
+        collection=collection_name,
+        k=k,
+        cached=cached is not None,
+    ) as span:
+        if cached is not None:
+            chunks = cached
+        else:
+            vector_result = vector_similarity_search(collection_name, query_change, k=k)
+            chunks = rerank(vector_result, query_change)
+            cache.set_json(name, chunks, CACHE_TTL_RETRIEVAL)
+        span.output = chunks
+
+    return chunks
 
 
 def get_vector_search(query, collection_list, external_docs=None) -> list:
     """在给定集合列表上做混合检索 + 重排，返回重排后的 chunk 列表。
 
     返回 list[str]（而不是拼好的大字符串）是为了让多轮检索结果能按 chunk 粒度去重。
-    external_docs 非 None 时改在调用方给的这批文本里检索（评测场景），忽略 collection_list。
+    external_docs 非 None 时改在调用方给的这批文本里检索（评测场景），忽略 collection_list；
+    这批语料每次调用都不同且只在本次有效，因此不走缓存。
     """
     result = []
     query_change = query_rewriting(query)
@@ -301,14 +364,7 @@ def get_vector_search(query, collection_list, external_docs=None) -> list:
         return rerank(vector_result, query_change)
 
     for co_name in collection_list:
-        with log_step(
-            "vector_search", input=query_change, collection=co_name, k=6
-        ) as span:
-            vector_result = vector_similarity_search(co_name, query_change, k=6)
-            # Document 对象直接进日志会是 <Document ...> 这样的 repr，这里只取正文
-            span.output = [doc.page_content for doc in vector_result]
-
-        result.extend(rerank(vector_result, query_change))
+        result.extend(_cached_vector_search(co_name, query_change, 6))
 
     return result
 
@@ -530,6 +586,23 @@ def self_reflection(query, vector_result, web_result):
     return result.content
 
 def get_result(query: QueryRequest, history_string: str, memory_string: str = ""):
+     # 只有「没有历史、没有长期记忆、没有上传文件」时，整条链路才只由 question 决定，
+     # 这时按 question 缓存最终答案不会串味；否则同一个问题在不同会话、不同画像下
+     # 答案并不相同，用 question 当键会把 A 会话的答案喂给 B 会话。
+     name = (
+         cache.key("answer", cache.digest(query.question))
+         if not history_string and not memory_string and not query.file_content
+         else None
+     )
+     if name:
+         cached = cache.get_json(name)
+         if cached is not None:
+             logger.info(
+                 "answer.cached",
+                 extra={"fields": {"question": query.question, "chars": len(cached)}},
+             )
+             return AIMessage(content=cached)
+
      # 检索通道（知识库 / 网络）改由 retrieval_planner 依据提问自动决定，
      # 不再读 query 上的开关字段。
      context = _retrieve_and_reflect(query.question)
@@ -565,7 +638,7 @@ def get_result(query: QueryRequest, history_string: str, memory_string: str = ""
         用户上传的文件内容是：{file_content}
         与用户提问相关的信息是：{context}
         """
-     return _generate(
+     result = _generate(
          prompt_template,
          {
              "question": query.question,
@@ -578,20 +651,95 @@ def get_result(query: QueryRequest, history_string: str, memory_string: str = ""
          has_memory=bool(memory_string),
      )
 
+     # 只缓存正文：AIMessage 上的 usage_metadata 是从缓存里还原不出来的，
+     # 硬造一份反而会让日志里的 token 统计变成假数据。
+     if name:
+         cache.set_json(name, result.content, CACHE_TTL_ANSWER)
+     return result
+
+def answer_with_file(
+    filename: str,
+    content: bytes,
+    question: str | None,
+    session_id: str | None,
+    user_id: str,
+) -> dict:
+    """上传文件的完整问答流程：解析 → 取记忆 → 检索生成 → 落会话 → 写记忆。
+
+    这段编排原先写在 main.upload_file 里。上传改成异步任务后 worker 也要跑同一套流程，
+    留在入口层就会变成一份逻辑两个副本（而「同步兜底」这条路两个入口都要用），
+    因此下沉到这里：main 用 run_in_threadpool 调它，worker 直接调它。
+
+    同步函数 —— 内部全是阻塞调用（PyMuPDF、VLM、Embedding、LLM），
+    调用方负责放进线程池或放进 worker 进程。
+    """
+    with log_step(
+        "document.parse",
+        input={"file": filename, "bytes": len(content)},
+    ) as parse_span:
+        # format 不支持时抛 UnsupportedFormatError，交给调用方映射成 400
+        blocks = document_loader.parse_document(filename, content)
+        file_content = document_loader.blocks_to_text(blocks)
+        parse_span.output = {
+            "blocks": len(blocks),
+            "images": sum(1 for block in blocks if block.kind == "image"),
+            "chars": len(file_content),
+        }
+
+    query_request = QueryRequest(
+        question=question or "请分析上传的文件",
+        session_id=session_id,
+        file_content=file_content,
+    )
+
+    session_id = get_or_create_session(query_request.session_id)
+    history_string = get_history_str(session_id)
+
+    with log_step(
+        "memory.build_context", session_id=session_id, user_id=user_id
+    ) as memory_span:
+        memory_string = memory.build_context(user_id, session_id, query_request.question)
+        memory_span.output = memory_string
+
+    result = get_result(query_request, history_string, memory_string)
+
+    add_message(
+        session_id,
+        ChatMessage(
+            role="user",
+            content=f"已上传文件: {filename}"
+            + (f"\n问题: {question}" if question else ""),
+        ),
+    )
+    add_message(session_id, ChatMessage(role="assistant", content=result.content))
+
+    memory.after_turn(user_id, session_id, query_request.question, result.content)
+
+    return {
+        "answer": result.content,
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
 def add_self_introduction(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
     vector_store = load_vector_store("self_introduction")
     vector_store.add_documents(docs)
+    # 集合内容变了，旧的检索缓存必须立刻作废，否则同一个问题会一直答出旧文档
+    cache.bump_kb_version("self_introduction")
 
 def add_music_analysis(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
     vector_store = load_vector_store("music_analysis")
     vector_store.add_documents(docs)
+    cache.bump_kb_version("music_analysis")
 
 def add_music_list(text: str):
     docs = SemanticChunker(overlap_size=0, max_chunk_size=500).chunk_document(text)
     vector_store = load_vector_store("music_list")
     vector_store.add_documents(docs)
+    cache.bump_kb_version("music_list")
 
 def get_result_evaluate(query: str, external_docs: list | None = None):
      # 与 get_result 共用同一条「通道规划 → 检索 → 补充检索 → 自反思」链路，

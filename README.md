@@ -2,7 +2,8 @@
 
 一个基于 **RAG（检索增强生成）** 的音乐知识问答系统。后端使用 FastAPI + LangChain 编排
 「查询重写 → 智能路由 → 向量/网络检索 → 重排序 → 自反思过滤 → 生成」的完整链路，
-前端使用 React 提供聊天界面，向量数据由 ChromaDB 本地持久化。
+前端使用 React 提供聊天界面。知识库向量数据由 ChromaDB 本地持久化，
+**会话与三层记忆以 Redis 为准**（Redis 8 自带的 RediSearch 向量索引承载情景记忆与用户画像）。
 
 ---
 
@@ -14,11 +15,20 @@
 - **智能路由（Collection Router）**：由 LLM 判断问题应该落到哪个集合，支持多集合同时命中。
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%。
 - **自反思过滤（Self-Reflection）**：在生成答案前，先由 LLM 从知识库/网络结果中剔除无关信息。
-- **多轮对话 + 三层记忆**：会话落盘在 SQLite（多 worker 共享、重启不丢），并在此基础上分三层记忆——**工作记忆**（最近 4 条消息 + 超过阈值后由 LLM 压缩出的滚动摘要）、**情景记忆**（同一 `user_id` 的跨会话历史问答，Chroma 按语义相似度检索）、**用户画像**（从对话中抽取的长期偏好与实体，Chroma 存储）。
+- **多轮对话 + 三层记忆**：会话以 Redis 为准（多 worker 共享、重启不丢），并在此基础上分三层记忆——**工作记忆**（最近 4 条消息 + 超过阈值后由 LLM 压缩出的滚动摘要，Redis list + hash）、**情景记忆**（同一 `user_id` 的跨会话历史问答，Redis RediSearch 按语义相似度检索）、**用户画像**（从对话中抽取的长期偏好与实体，同样存在 RediSearch 索引里）。三层同源，过期与备份只有一套策略。
 - **文件问答**：上传 `.pdf` / `.docx`，或直接上传一张图片（`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`）
   单独提问。文档会同时解析正文与内嵌图片——图片由视觉模型（VLM）
   转成中文描述后一起参与问答，扫描页（无文字层）自动整页渲染识别。
+  解析与生成走**异步任务队列**（有 Redis 时）：接口立刻返回 `task_id`，前端轮询进度，
+  HTTP 连接不必为几十张图的 PDF 干等几分钟。
 - **知识库动态写入**：可在前端直接录入「个人信息 / 音乐理解 / 歌单」三类私人数据。
+- **Redis 一栈到底**：会话、三层记忆、缓存、限流、上传队列共用一个 Redis 8 实例。**会话与记忆是正确性依赖**，`REDIS_URL` 必须配置，连不上时启动即报错（不会静默降级成「这是一段新对话」）；**缓存 / 限流 / 队列是可选的**，Redis 不可用时自动失效，链路照常跑。
+- **四层缓存（可选）**：按「输入是否唯一决定输出」分四层缓存——嵌入向量、查询重写与集合路由结果、
+  单集合的检索结果、最终答案；知识库写入时按集合版本号定向失效。未配 `REDIS_URL` 时自动降级为不缓存，链路照常跑。
+  实测重复提问时整条链路从 49.3s 降到 0.002s。
+- **接口限流（可选）**：`/api/chat` 与 `/api/upload` 走 Redis 令牌桶限流（Lua 保证原子），
+  超限返回 `429` 并带 `Retry-After`；按 `user_id` 计数，没有 `user_id` 时退回客户端 IP
+  （否则清空 `localStorage` 即可绕过）。Redis 不可用时**一律放行**，不会因为限流组件故障拒掉正常请求。
 - **离线评测**：内置 BLEU、ROUGE 与 LLM 忠诚度打分脚本（`llm_ev.py`），以及在 RGB 中文基准
   `zh_refine.json`（300 条）上的端到端评测（`rgb_eval.py`，当前准确率 91%）。
 
@@ -30,8 +40,12 @@
 | --- | --- |
 | 后端框架 | FastAPI + Uvicorn |
 | LLM 编排 | LangChain（`langchain-openai`、`langchain-chroma`、`langchain-classic`、`langchain-community`） |
-| 向量数据库 | ChromaDB 1.4.0（本地持久化，无需独立服务或 Docker） |
-| 会话存储 | SQLite（标准库 `sqlite3`，WAL 模式，多进程共享同一个文件） |
+| 向量数据库 | ChromaDB 1.4.0（知识库三集合，本地持久化，无需独立服务或 Docker） |
+| 会话存储 | Redis（key 前缀 `sess:`：meta hash + msgs list + 滚动摘要；消息追加与压缩提交走 Lua 保证原子） |
+| 记忆存储 | Redis RediSearch 向量索引（HNSW / FLOAT32 / COSINE，一份 hash 同时存正文、时间戳与向量） |
+| 缓存 | Redis（可选降级：未配 `REDIS_URL` 或连不上时不缓存，链路照常跑） |
+| 限流 | Redis 令牌桶（Lua 脚本原子扣减；Redis 不可用时放行） |
+| 任务队列 | Redis 列表（`RPUSH` 入队 + `BLPOP` 出队，由独立进程 `worker.py` 消费；Redis 不可用时上传退回同步） |
 | 检索 | Chroma 稠密检索 + BM25 稀疏检索，经 `EnsembleRetriever` 加权融合，再由 Reranker（SiliconFlow `Qwen/Qwen3-Reranker-8B`）截取前 50% |
 | 联网搜索 | Tavily HTTP 接口（用 `httpx` 直调，带超时与 `tenacity` 重试） |
 | 文档解析 | PyMuPDF（PDF 文字 / 内嵌图 / 扫描页）、python-docx + zip（DOCX 正文与图片）、Pillow（图片尺寸） |
@@ -45,21 +59,27 @@
 ```
 bishe/
 ├── main.py                 # FastAPI 入口，路由、文件上传（会话已外置到 session_store.py）
-├── rag.py                  # RAG 主链路：查询重写、检索、自反思、答案生成
+├── rag.py                  # RAG 主链路：查询重写、检索、自反思、答案生成、上传文件问答流程
+├── worker.py               # 上传任务消费者：独立进程从队列取任务，跑「解析 → 检索生成 → 落库」
+├── tasks.py                # 任务队列原语：入队/取任务/状态读写、暂存文件、结果与 TTL
+├── ratelimit.py            # 接口限流：Lua 令牌桶、按 user_id/IP 计数、Redis 不可用时放行
 ├── collection_router.py    # LLM 结构化输出做集合路由（含独立测试入口）
 ├── retrieval_planner.py    # LLM 结构化输出做检索决策：通道规划 + 信息是否充分
 ├── document_loader.py      # 上传解析：PDF/DOCX 正文与内嵌图、独立图片、VLM 图片描述、描述缓存
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
 ├── fixed_chunk.py          # 固定长度 + 重叠的等步长切分（FixedChunker），用于对比切分方式
-├── config.py               # 模型 / 密钥 / Chroma 路径 / 会话库路径的统一配置入口
+├── config.py               # 模型 / 密钥 / Chroma 路径 / Redis（会话与记忆）的统一配置入口
+├── cache.py                # Redis 连接与缓存层：键前缀、嵌入/检索/答案缓存、集合版本失效、连接降级
+├── ratelimit.py            # 接口限流：Lua 令牌桶、按 user_id/IP 计数、Redis 不可用时放行
 ├── observability.py        # 链路追踪 + 结构化日志：span、JSON 格式、分步输入输出/耗时/token
 ├── trace_view.py           # 按 request_id 把日志还原成调用树（离线看链路）
-├── session_store.py        # 会话持久化：SQLite 建表、消息增删查、滚动摘要与压缩认领
+├── session_store.py        # 会话持久化：Redis 键设计、消息增删查、滚动摘要与压缩认领（Lua 保证原子）
 ├── memory/                 # 三层记忆
 │   ├── __init__.py         #   对外入口：build_context（取记忆）/ after_turn（写记忆）
 │   ├── working.py          #   工作记忆：消息超阈值时用 LLM 压缩成滚动摘要
-│   ├── episodic.py         #   情景记忆：跨会话问答的 Chroma 读写
+│   ├── ft_index.py         #   RediSearch 向量索引封装：建索引、写入、KNN 检索、按用户计数
+│   ├── episodic.py         #   情景记忆：跨会话问答的读写与「相似度 + 时间近因性」排序
 │   └── profile.py          #   用户画像：长期偏好/实体的抽取与检索
 ├── models/                 # 接口层与业务层共用的 Pydantic 数据结构
 ├── .env.example            # 环境变量模板（复制为 .env 后填写）
@@ -67,9 +87,10 @@ bishe/
 ├── rgb_eval.py             # RGB 中文基准评测：合并 positive/negative → 切块 → 走完整 RAG 链路
 ├── eval_results/           # 评测逐条明细与汇总（运行时生成，不入库）
 ├── self_data/              # 示例私人语料（自我介绍、音乐分析、歌单）
-├── chroma_db/              # Chroma 持久化数据（运行时生成，不入库）
-├── sessions.db             # 会话库（运行时生成，不入库）
+├── chroma_db/              # Chroma 持久化数据（知识库三集合，运行时生成，不入库）
 ├── uploaded_images/        # 上传文档抽出的图片与描述缓存（运行时生成，不入库）
+├── uploaded_files/         # 上传任务排队期间的暂存文件（worker 处理完即删，不入库）
+├── .redis/                 # Redis 容器数据卷（会话 / 记忆 / 缓存都在这，运行时生成，不入库；容器启动命令见下文）
 └── music-chatbot-frontend/ # React 前端
     └── src/
         ├── App.js          # 聊天界面、会话管理、知识库录入、文件上传
@@ -111,10 +132,47 @@ bishe/
 
 通道规划判定「都不需要」时跳过全部检索与自反思，直接由生成步骤凭自身知识作答。
 
+### 文件上传（异步任务）
+
+```
+POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPUSH）──► 202 {status:"queued", task_id}
+                                        │
+          worker.py ── BLPOP 取任务 ──► 解析（PyMuPDF / DOCX / VLM 逐张识图）
+                                        └─► 三层记忆 → 检索生成 → 落会话与记忆 → 结果写回任务记录
+                                        │
+          前端轮询 GET /api/task/{task_id} ──► {status: queued|running|done|failed, answer, …}
+```
+
+没有 Redis 时 `tasks.submit()` 返回 `None`，`/api/upload` 就地把同一套流程跑完，
+返回 `200 {status:"done", answer}` —— 队列是可选设施，不能因为没装 Redis 就让上传不可用。
+
 分块策略见 [dynamic_chunk.py](file:///d:/bishe/dynamic_chunk.py)：先按中英文标点切句，逐句向量化，
 相邻句余弦相似度低于 `0.7` 处切分，再按 `max_chunk_size` 强制截断并支持重叠。
 另有一种不做语义判断、按固定长度等步长（可带重叠）切分的 [fixed_chunk.py](file:///d:/bishe/fixed_chunk.py)，
 两者接口一致，评测时可切换以对比切分方式的影响。
+
+### 会话存储（Redis）
+
+实现在 [session_store.py](file:///d:/bishe/session_store.py)。会话原先落在本地 SQLite 文件，
+换成 Redis 之后除了继续满足「多 worker 共享、进程重启不丢」，还多了一层：API 进程与 worker 进程
+不必再共享同一个文件系统，会话与记忆同源，过期、容量、备份只有一套策略。
+
+| 键 | 类型 | 内容 |
+| --- | --- | --- |
+| `{prefix}:sess:{id}:meta` | HASH | `created_at` / `updated_at` / `next_id`（消息自增 id） |
+| `{prefix}:sess:{id}:msgs` | LIST | 消息，元素是 JSON `{id, role, content, timestamp}` |
+| `{prefix}:sess:{id}:sum` | STRING | 滚动摘要 |
+| `{prefix}:sess:{id}:claim` | STRING | 压缩认领（`SET NX PX`，值 = 认领时刻） |
+
+- **会话是正确性依赖，不是缓存**：缓存 / 限流 / 队列拿不到 Redis 可以降级，会话不行——
+  降级只会把「读不到历史」伪装成「这是一段新对话」，属于静默的数据错误。因此这里取连接用
+  `cache.require_client()`，拿不到就抛错（缺 `REDIS_URL` 或连不上时，`init_db()` 在启动阶段即报错）。
+- **两段 Lua 保证原子**：追加消息要「取号 → 入队 → 裁剪 → 续期」四步，拆开会有两个 worker 拿到同一号、
+  或消息顺序与 id 顺序不一致的竞态；提交压缩要「写摘要 → 删消息 → 释放认领」原子完成，
+  否则会出现「摘要更新了但消息没删」这类中间态。
+- **TTL**：默认 `SESSION_TTL_SECONDS`（30 天），每次读写都续期，活跃会话不会过期。
+- **硬上限兜底**：消息条数超过 `MAX_MESSAGES_HARD`（200）时直接裁掉最旧的，正常路径永远不该触发
+  （压缩会先把消息降回 4 条），一旦触发会打 `messages.hard_trim` 警告暴露问题。
 
 ### 三层记忆
 
@@ -123,11 +181,11 @@ bishe/
 
 | 层 | 存储 | 内容 | 读写时机 |
 | --- | --- | --- | --- |
-| 工作记忆 | SQLite `messages` / `session_summaries` | 最近 4 条消息 + 一段滚动摘要 | 每轮直接读；消息超过 `HISTORY_WINDOW + COMPRESS_BATCH`（14）条时由 LLM 把最旧一批并入摘要并删除 |
-| 情景记忆 | Chroma 集合 `episodic_memory` | 同一 `user_id` 的跨会话历史问答 | 每轮写一条；回答前按「语义相似度 + 时间近因性」加权排序，排除当前会话 |
-| 用户画像 | Chroma 集合 `user_profile` | 长期偏好与实体（一条一个原子事实） | 每轮由 LLM 抽取（失败降级为空）；回答前按语义相似度检索 |
+| 工作记忆 | Redis `sess:{id}:meta` / `:msgs` / `:sum` | 最近 4 条消息 + 一段滚动摘要 | 每轮直接读；消息超过 `HISTORY_WINDOW + COMPRESS_BATCH`（14）条时由 LLM 把最旧一批并入摘要并删除 |
+| 情景记忆 | Redis RediSearch 索引 `{prefix}:memidx:episodic_memory` | 同一 `user_id` 的跨会话历史问答 | 每轮写一条；回答前按「语义相似度 + 时间近因性」加权排序，排除当前会话 |
+| 用户画像 | Redis RediSearch 索引 `{prefix}:memidx:user_profile` | 长期偏好与实体（一条一个原子事实） | 每轮由 LLM 抽取（失败降级为空）；回答前按语义相似度检索 |
 
-**情景记忆的时间衰减**：同样相关时，刚聊过的内容优先于很久以前的。每条记忆的 `metadata.timestamp`
+**情景记忆的时间衰减**：同样相关时，刚聊过的内容优先于很久以前的。每条记忆的 `ts`
 （ISO 时间）参与打分，最终得分把两项加权求和：
 
 ```
@@ -137,9 +195,11 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 
 `decay_factor = 0.1` 时，1 天前约 0.90、1 周前约 0.50、1 个月前约 0.05。
 
-相似度由 Chroma 的距离折算：本集合 `hnsw.space = l2`，Chroma 在 l2 空间返回的是**平方**欧氏距离，
-而嵌入是 4096 维单位向量，故 `cos(q,v) = 1 - d/2`（负相关截到 0）。这里**不能**照搬 langchain 的
-`1 - d/√2` —— 它假设 d 是普通 L2 距离，套在平方距离上会恒为负、把所有候选压成 0。
+相似度直接由 RediSearch 的 KNN 得到：索引按 `DISTANCE_METRIC COSINE` 建，`FT.SEARCH ... =>[KNN k @vec $q AS score]`
+返回的 `score` 是**余弦距离**，`相似度 = 1 - score`（负相关截到 0）。这与原先 Chroma 的
+`hnsw.space = l2` + 平方距离折算（`cos = 1 - d/2`）不同——后者要专门绕开 langchain 的
+`1 - d/√2`（它假设 d 是普通 L2 距离，套在平方距离上会恒为负）。换成 RediSearch 后这段折算消失，
+代价是索引维度由**第一次写入的向量**决定（`FT.CREATE` 的 `DIM` 取 `len(vector)`），换嵌入模型需重建索引。
 
 折算出的绝对余弦还会在**候选集内做一次 min-max 归一化**再参与加权：本模型对长短文本的余弦值被
 压在很窄的带里（实测同主题约 0.25、不同主题约 0.20，只差 0.055），绝对量纲下相似度最多只能贡献
@@ -154,11 +214,98 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 - **身份隔离**：前端首次访问生成 `user_id` 并存入 `localStorage`（`music_rag_user_id`），随请求带给后端。
   「跨会话」指同一 `user_id` 下的多个 `session_id`。请求不带 `user_id` 时整个记忆层跳过，
   因此 `llm_ev.py` / `rgb_eval.py` 等离线评测不受影响。
-- **压缩走两阶段**：`claim_compression`（抢压缩权）→ LLM 生成摘要 → `commit_compression`（同一事务写摘要 + 按 id 删消息 + 释放认领）。
-  LLM 调用不在事务内，`compression_claims` 保证多 worker 下同一会话不会被重复压缩，认领 60s 过期以兜住进程崩溃。
+- **为什么向量用 RediSearch 而不是别的**：一份 hash 同时存正文、时间戳与向量，KNN 命中时一次往返就把正文取回来，
+  不必额外维护「元素 id → 属性」的旁路结构，也就没有两者的同步问题；向量按 float32 原样存，没有量化误差；
+  按 `uid` 做 TAG 过滤是服务端行为，别人的记忆根本不会进入候选集。
+- **TAG 值先 md5 再进索引**：`user_id` / `session_id` 都来自客户端，可以是任意字符串，而 RediSearch 的 TAG
+  查询要转义 `{ } $ \ |` 等字符并按分隔符切分。先摘要就不需要任何转义，索引与查询两侧永远一致；
+  原始值另存普通字段（`user` / `session`）用于排查与读回。读回的必须是**原始** session_id——
+  否则调用方拿它当 `exclude_session_id` 回传时会被再摘要一次，过滤条件永远匹配不上。
+- **压缩走两阶段**：`claim_compression`（`SET NX PX` 抢压缩权）→ LLM 生成摘要 → `commit_compression`
+  （一段 Lua 原子完成「写摘要 + 按 `id <= max_id` 弹消息 + 释放认领 + 续期」）。
+  LLM 调用不在脚本内，Lua 保证多 worker 下同一会话不会被重复压缩，认领 60s 过期以兜住进程崩溃。
+  按 `id` 而非「前 N 条」删除，压缩期间新插入的消息（id 更大）不会被误删。
 - **确定性文档 id**：情景记忆用 `md5(user_id | session_id | 问答)`，画像用 `md5(user_id | 事实文本)`，
-  借助 Chroma 的 upsert 天然幂等去重。
-- 可调参数：`EPISODIC_TOP_K`、`PROFILE_TOP_K`、`MEMORY_SNIPPET_CHARS`、`EPISODIC_DECAY_FACTOR`、`EPISODIC_RECENCY_WEIGHT`、`EPISODIC_COLLECTION`、`PROFILE_COLLECTION`（见 `.env.example`）。
+  落到同一个 `memdoc:*` hash 上重复写即覆盖，天然幂等去重。
+- 可调参数：`EPISODIC_TOP_K`、`PROFILE_TOP_K`、`MEMORY_SNIPPET_CHARS`、`EPISODIC_DECAY_FACTOR`、`EPISODIC_RECENCY_WEIGHT`、`EPISODIC_COLLECTION`、`PROFILE_COLLECTION`（见 `.env.example`）。记忆本身不设 TTL，与原 Chroma 实现一致。
+
+### 缓存（Redis）
+
+缓存按「输入是否唯一决定输出」从低风险到高风险分四层，统一收口在 [cache.py](file:///d:/bishe/cache.py)
+（键前缀、序列化、降级、失效都在这一个文件里）。命中情况直接进链路日志：`query_rewriting` /
+`collection_router` / `vector_search` 三个 span 都多了一个 `cached` 字段。
+
+| 层 | 缓存对象 | 键的组成 | TTL | 失效方式 |
+| --- | --- | --- | --- | --- |
+| ① | `embed_query` 算出的向量 | 文本摘要 | 1 天 | 只由文本决定，无需失效 |
+| ② | 查询重写 / 集合路由结果 | 输入文本摘要 | 1 小时 | TTL |
+| ③ | 单集合的「混合检索 + 重排」结果 | 集合名 + 集合版本 + 改写后的查询 + k | 1 小时 | 知识库写入时集合版本 +1，旧键立刻失联 |
+| ④ | 最终答案 | 问题摘要 | 5 分钟 | TTL |
+
+- 嵌入缓存包在 `config.get_embeddings()` 里（[config.py](file:///d:/bishe/config.py#L142-L159)），
+  一次覆盖 Chroma 检索、分块、记忆写入全部调用方。`embed_documents` 不走缓存 —— 建库时每段文本都不相同，
+  缓存只白占内存不省时间。
+- ④ 只在**没有历史、没有长期记忆、没有上传文件**时才启用（[rag.py](file:///d:/bishe/rag.py#L582-L598)）：
+  其余情况下同一个问题在不同会话、不同画像下答案本来就不同，拿问题当键会把 A 会话的答案喂给 B 会话。
+- 键统一带 `REDIS_KEY_PREFIX`（默认 `musicrag:v1`），改版本号即可让旧格式缓存整体作废。
+- 失效用**版本号**而不是 `SCAN` 删键：集合级版本号自增后旧键再也拼不出来，剩下的靠 TTL 自然过期，
+  既不阻塞遍历，也不会漏删。
+- 值只存 JSON 与 float32 二进制，不用 pickle —— 缓存是可丢弃的派生物，不该在依赖升级后因为反序列化
+  失败把进程带崩。4096 维向量存 float32 是 16 KB，存 JSON 数组要 80 KB。
+- 同步 redis 客户端会阻塞事件循环，因此缓存调用都发生在已经下沉线程池的**同步**链路里
+  （`rag.get_result`、`memory.*` 都由 `run_in_threadpool` 执行）。
+- Redis 连不上时只在第一次打一条 `cache.unavailable` 警告，之后静默降级；连接失败不会被记住，
+  Redis 起来后不重启进程就能恢复。
+
+### 接口限流
+
+实现在 [ratelimit.py](file:///d:/bishe/ratelimit.py)，复用缓存那一份 Redis 连接配置。
+
+| 接口 | 容量（可突发次数） | 补充速率 | 含义 |
+| --- | --- | --- | --- |
+| `/api/chat` | 20 | 0.2 次/秒 | 平时约 12 次/分钟，最多连打 20 次 |
+| `/api/upload` | 5 | 0.05 次/秒 | 平时约 3 次/分钟，最多连打 5 次 |
+
+- **为什么用 Lua**：一次限流要做「读令牌 → 按时间差补令牌 → 扣令牌 → 写回」四步，
+  拆成多次 Redis 调用就会出竞态——两个并发请求可能读到同一份「够用」的令牌双双放行。
+  Redis 单线程执行 Lua 脚本，正好把这一串动作压成一次原子调用。
+- **令牌桶而不是固定窗口**：桶按距上次访问的时间差惰性补充 `elapsed × refill_per_sec`
+  （补到容量为止），不会像固定窗口那样在窗口切换的瞬间放行两倍流量；桶第一次出现时直接装满，
+  新用户/新 IP 不会一上来就被卡。
+- **自动回收**：桶是一个 hash（剩余令牌 `tokens` + 上次补充时刻 `ts`），`PEXPIRE` 设成
+  「桶重新装满的时间 + 60s」，长时间没人访问就自己消失，不必清理。
+- **超限响应**：`429`，`detail` 写明还要等几秒，响应头带 `Retry-After`。
+- **限流主体**：优先用前端存在 `localStorage` 的 `user_id`（桶键 `u:<id>`），
+  没有则退回客户端 IP（桶键 `ip:<host>`）——不退到 IP 的话，清空 `localStorage` 就能绕过限流。
+  两者是不同的桶，互不牵连。
+- **fail-open**：Redis 连不上或脚本调用报错时**一律放行**，只打一条 `ratelimit.error` 警告。
+  限流是保护自己的措施，不是正确性依赖；保护层自己挂了却把正常请求也拒掉，是把可用性
+  换成了理论上的安全，不划算。
+- `/api/upload` 的限流放在 `file.read()` **之前**，超限的请求在读进内存、调 VLM 之前就被拦下。
+
+### 异步上传任务
+
+实现在 [tasks.py](file:///d:/bishe/tasks.py)（队列原语）与 [worker.py](file:///d:/bishe/worker.py)（消费者）。
+
+- **为什么要排队**：一次上传要先用 PyMuPDF/DOCX 解析正文，再逐张把内嵌图交给 VLM 出描述，
+  然后才走完整的 RAG 链路。几十张图的 PDF 能跑几分钟，同步处理意味着这个 HTTP 连接
+  一直挂着，Nginx/浏览器都可能先超时断开，而活还在照样跑。
+- **为什么是独立进程**：FastAPI 的 `BackgroundTasks` 仍在同一个进程里跑，照样占着线程池，
+  进程重启任务就没了。独立 worker 可以和 API 分头重启，队列里的任务不丢，
+  也能按需多开几个进程一起消费。
+- **队列就是 Redis 列表**：`RPUSH` 入队、`BLPOP` 出队，天然 FIFO，不引额外中间件；
+  任务状态另存一个 hash（`status` / `payload` / `result` / `error` / `request_id`），带 TTL 自动回收。
+- **文件不进 Redis**：payload 里只放暂存文件路径（`UPLOAD_SPOOL_DIR`）。几十 MB 的 PDF 塞进
+  同一个 Redis 实例，会挤掉缓存、让 AOF 重写变大；worker 处理完（成功或失败）都会删掉暂存文件。
+- **链路可追踪**：入队时把当时 HTTP 请求的 `request_id` 一起存进任务记录，worker 取到任务后
+  把它接回 `contextvar`，因此这次上传的日志在 `python trace_view.py app.log --request-id <id>`
+  里仍是完整的一棵树（跨进程）。
+- **session 与记忆写在 worker 侧**：`add_message` / `memory.after_turn` 与生成在同一处，
+  顺序和原先的同步实现完全一致；worker 启动时自己 `init_db()`，不依赖 API 进程先建表。
+- **任务状态**：`queued → running → done / failed`。失败时 `error` 里带原因（如格式不支持），
+  前端直接展示；任务记录默认存活 `TASK_TTL_SECONDS`（2 小时），过期后轮询返回 404。
+- **不做重投递**：worker 崩了任务会停在 `running` 并随 TTL 消失。个人项目上任务重投递要引入
+  确认-超时-重排的完整机制，复杂度远大于收益。
 
 ---
 
@@ -169,31 +316,37 @@ final_score   = (1 - w) * 相似度 + w * recency_score    # w 默认 0.3
 | POST | `/api/chat` | 发送消息，返回答案与 `session_id` |
 | GET | `/api/chat/history/{session_id}` | 查询会话历史（`number` 可选，默认 20） |
 | DELETE | `/api/chat/history/{session_id}` | 清空指定会话历史 |
-| POST | `/api/upload` | 上传 `.pdf` / `.docx` / 图片（`.png` `.jpg` `.jpeg` `.gif` `.webp`）并提问（含图片描述），其它格式返回 400 |
+| POST | `/api/upload` | 上传 `.pdf` / `.docx` / 图片（`.png` `.jpg` `.jpeg` `.gif` `.webp`）并提问（含图片描述），其它格式返回 400。有 Redis 时返回 `202` + `task_id`（202 表示已入队，不是已完成），无 Redis 时退回同步处理、返回 `200` + 答案 |
+| GET | `/api/task/{task_id}` | 轮询上传任务：`status` 为 `queued` / `running` / `done` / `failed`，`done` 带答案，`failed` 带 `error`；任务不存在或已过期返回 404 |
 | POST | `/api/knowledge/self-introduction` | 写入个人信息 |
 | POST | `/api/knowledge/music-analysis` | 写入音乐理解 |
 | POST | `/api/knowledge/music-list` | 写入歌单 |
 
 服务启动后可在 `http://localhost:8000/docs` 查看 Swagger 文档。
 
+两个高成本接口 `/api/chat` 与 `/api/upload` 受令牌桶限流保护（见「接口限流」），
+超限时返回 `429` 与 `Retry-After`；其余接口不限流。
+
 ---
 
 ## 快速开始
 
-ChromaDB 以嵌入式方式运行，数据直接落盘到 `CHROMA_PERSIST_DIR`；会话库是标准库 `sqlite3`
-写的单个文件 `sessions.db`。**两者都不需要 Docker，也不需要单独启动数据库服务**。
+**Redis 是必须的**：会话与三层记忆都以它为准，没配好 `REDIS_URL` 启动就会报错（见第 4 步）。
+知识库的 ChromaDB 仍以嵌入式方式运行，数据直接落盘到 `CHROMA_PERSIST_DIR`，不需要单独启动服务。
+缓存、限流与上传任务队列复用同一个 Redis 实例，但它们仍是可选的：
+Redis 不可用时缓存退化成每次都算、限流一律放行、上传退回同步处理，会话与记忆之外的链路照常工作。
 
 ### 1. 后端依赖
 
 ```bash
 pip install fastapi uvicorn langchain langchain-openai langchain-chroma langchain-classic \
     langchain-community chromadb rank-bm25 httpx tenacity jieba nltk rouge-score \
-    numpy torch python-multipart python-dotenv pymupdf python-docx pillow
+    numpy torch python-multipart python-dotenv pymupdf python-docx pillow redis
 ```
 
 ### 2. 配置模型与密钥
 
-模型名、`api_key`、`base_url`、Chroma 存储路径全部集中在 [config.py](file:///d:/bishe/config.py)，
+模型名、`api_key`、`base_url`、Chroma 存储路径、Redis 地址全部集中在 [config.py](file:///d:/bishe/config.py)，
 通过环境变量读取，不再散落在各业务文件里：
 
 ```bash
@@ -205,12 +358,17 @@ cp .env.example .env    # 然后填写 .env
 
 需要填写的变量见 [.env.example](file:///d:/bishe/.env.example)：`OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 `LLM_MODEL` / `EMBEDDING_MODEL`（对话与向量模型，OpenAI 兼容接口）、`TAVILY_API_KEY`（联网搜索）、
-`RERANK_API_KEY`（重排序）、`CHROMA_PERSIST_DIR`（向量库落盘目录，默认 `./chroma_db`）、
-`SESSION_DB_PATH`（会话库文件路径，默认 `./sessions.db`）、
+`RERANK_API_KEY`（重排序）、`CHROMA_PERSIST_DIR`（知识库向量库落盘目录，默认 `./chroma_db`）、
 `RERANK_TIMEOUT` / `WEB_SEARCH_TIMEOUT` / `HTTP_RETRIES`（外部调用的超时秒数与重试次数）、
 `MAX_SUPPLEMENT_ROUNDS`（检索不足时最多追加几轮补充检索，默认 2，设 0 关闭）、
 `VLM_MODEL` / `VLM_TIMEOUT`（上传文档的图片描述模型与超时，留空则不生成图片描述）、
 `IMAGE_MIN_SIZE`（**文档内嵌图**小于该像素直接丢弃，默认 100；用户单独上传的图片不受此限制）、`UPLOAD_IMAGE_DIR`（抽出的图片与描述缓存目录）、
+`REDIS_URL`（**必填**，会话与记忆的正确性依赖；格式 `redis://:密码@localhost:6379/0`）、
+`REDIS_KEY_PREFIX`（缓存 / 会话 / 记忆共用的版本前缀）、`SESSION_TTL_SECONDS`（会话键的存活秒数，默认 30 天）、
+`CACHE_TTL_*`（各层缓存的存活秒数）、
+`RATE_LIMIT_ENABLED`（限流总开关，置 false 关闭）、`RATE_LIMIT_CHAT_*` / `RATE_LIMIT_UPLOAD_*`
+（两类接口令牌桶的容量与每秒补充速率）、
+`TASK_TTL_SECONDS`（上传任务记录存活秒数，默认 7200）、`UPLOAD_SPOOL_DIR`（上传任务排队期间的暂存目录）、
 `LOG_LEVEL` / `TRACE_TEXT_LIMIT`（日志级别与链路追踪里每段输入输出的预览字符上限）。
 
 业务侧统一通过 `config.get_chat_model()`、`config.get_embeddings()`、`config.get_vlm()` 取实例，
@@ -226,7 +384,52 @@ cp .env.example .env    # 然后填写 .env
 
 分块与检索用的 Embedding 必须与建库时一致，改 `EMBEDDING_MODEL` 后需重建集合。
 
-### 4. 启动后端
+### 4. 启动 Redis（必须）
+
+会话、三层记忆、缓存、限流、上传任务队列都依赖这一个 Redis 实例。
+
+**镜像必须带 RediSearch 模块**：情景记忆与用户画像用的是向量索引（`FT.CREATE` / `FT.SEARCH`），
+官方 `redis:8-alpine` 自带（`redisearch` / `vectorset` / `timeseries` / `bf` / `ReJSON` 都在）。
+老版本或没带 `search` 模块的精简镜像会让记忆写入失败，因此**不要用 Redis 7 及以下**。
+
+```powershell
+mkdir D:\bishe\.redis
+docker run -d --name music-rag-redis -p 6379:6379 `
+  -v D:\bishe\.redis:/data `
+  --restart unless-stopped `
+  redis:8-alpine redis-server --appendonly yes --requirepass 你的密码
+```
+
+- `-v D:\bishe\.redis:/data` 把数据卷放到 D 盘（该目录已在 `.gitignore` 里），容器重建也不丢；
+  `--appendonly yes` 开启 AOF，Redis 重启后会话、记忆与缓存都还在；`--restart unless-stopped`
+  让它随 Docker Desktop 自动拉起。
+- 这只解决了**数据**的位置。Docker Desktop 自己的虚拟磁盘（镜像与容器可写层）默认仍在
+  `C:\Users\<用户名>\AppData\Local\Docker\wsl`，要挪到 D 盘得去 Settings → Resources →
+  Disk image location 改。
+- 国内直连 Docker Hub 拉不到镜像时，从镜像站拉完重新打标签即可：
+
+```powershell
+docker pull docker.m.daocloud.io/library/redis:8-alpine
+docker tag docker.m.daocloud.io/library/redis:8-alpine redis:8-alpine
+```
+
+起来之后把地址填进 `.env`：`REDIS_URL=redis://:你的密码@localhost:6379/0`。
+没配或连不上时，后端会在启动阶段（`init_db()` 自检）直接报错，而不是等第一个请求进来才失败。
+
+除会话与记忆外，其余三块仍是可选的降级行为：
+
+- 缓存：[cache.py](file:///d:/bishe/cache.py) 的 `get_client()` 在拿不到连接时返回 `None`，
+  所有缓存读写退化成空操作，链路照常跑，只是每次都重新算。
+- 限流：[ratelimit.py](file:///d:/bishe/ratelimit.py) 在拿不到连接时直接放行；
+  也可以用 `RATE_LIMIT_ENABLED=false` 显式关掉。
+- 任务队列：[tasks.py](file:///d:/bishe/tasks.py) 的 `submit()` 返回 `None` 时，
+  `/api/upload` 退回同步处理，前端直接拿到答案（不再需要 worker 进程）。
+
+> 换嵌入模型（`EMBEDDING_MODEL`）后，RediSearch 索引的维度会与新向量不匹配，需要
+> `FT.DROPINDEX {prefix}:memidx:episodic_memory` 与 `...:user_profile` 删掉索引、
+> 清理对应的 `{prefix}:memdoc:*` 后重新积累记忆；知识库的 Chroma 集合也要重建。
+
+### 5. 启动后端
 
 ```bash
 python main.py
@@ -235,7 +438,18 @@ python main.py
 
 后端默认运行在 `http://localhost:8000`。
 
-### 5. 启动前端
+### 6. 启动上传任务 worker（可选，配了 Redis 才需要）
+
+```bash
+python worker.py           # 前台常驻，Ctrl+C 退出
+python worker.py --once    # 只处理当前队列里的任务，处理完退出（调试用）
+```
+
+不启动它的话：`/api/upload` 照样返回 `202` + `task_id`，但任务会一直停在 `queued`
+（文件留在 `uploaded_files/` 里等 worker 来取），前端会一直显示「排队中...」。
+所以**只要配了 Redis，就得把 worker 跑起来**。
+
+### 7. 启动前端
 
 ```bash
 cd music-chatbot-frontend
@@ -341,14 +555,34 @@ python llm_ev.py
 | `retrieval_planner.failed` | 通道规划模型不可用，退化为「两者都检索」 | `error` |
 | `self_reflection.result` | 自反思过滤后的文本 | `content` |
 | `collection.create` / `collection.drop` | 知识库集合操作结果 | `collection`、`result`、`docs` |
+| `cache.ready` | Redis 连接建立成功（密码已抹掉） | `url` |
+| `cache.disabled` / `cache.unavailable` | 未配 `REDIS_URL` / 连不上 Redis，缓存降级为直算（只打一次） | `detail` |
+| `cache.error` | 运行期缓存读写异常，已忽略并继续（只打一次） | `detail` |
+| `answer.cached` | 最终答案命中缓存，整条链路短路 | `question`、`chars` |
+| `ratelimit.rejected` | 令牌桶耗尽，请求被拒（返回 429） | `bucket`、`identity`、`retry_after`、`capacity` |
+| `ratelimit.error` | 限流组件自身异常，已放行 | `bucket`、`error` |
+| `task.queued` | 上传任务入队成功 | `task_id`、`file`、`bytes`、`has_question` |
+| `task.done` | 上传任务处理完成 | `task_id`、`chars` |
+| `task.failed` / `task.unsupported` | 上传任务失败（后者是可预期的格式不支持），原因已写进任务记录 | `task_id`、`error` |
+| `task.missing` | worker 取到任务但记录已过期（队列里有 id、hash 却没了） | `task_id` |
+| `task.submit_failed` / `task.load_failed` / `task.update_failed` / `task.claim_failed` / `task.spool_cleanup_failed` | 队列自身读写异常，已忽略或退回同步 | `task_id`、`error`、`path` |
+| `worker.start` / `worker.no_redis` | worker 启动参数 / 拿不到 Redis 连接（此时上传走同步，队列用不上） | `once`、`detail` |
 
 **已埋点的步骤**：`request`（请求级）→ `rag.total`（RAG 链路汇总）→
 `retrieval_planner`、`query_rewriting`、`collection_router`、`vector_search`、`rerank`、
 `web_search`、`web_rewriting`、`retrieval_sufficiency`、`self_reflection`、`generate`。
 
+其中 `query_rewriting` / `collection_router` / `vector_search` 会多带一个 `cached` 字段
+（`true` 表示这一步直接读了 Redis，耗时接近于 0），离线看链路时一眼能分辨
+「这次快是因为缓存」还是「真的算得快」。
+
 补充检索会让同一 `request_id` 下出现多个同名的 `vector_search` / `web_search` / `query_rewriting` span，
 用 `span_id` 区分轮次（与「多个集合各检索一次」是同一套机制）。通道被判定为不需要时，
 对应的 `collection_router` / `web_rewriting` 等 span 会**整条不出现**，可据此确认通道确实没被白跑。
+
+上传任务由 worker 进程执行，除了上面这些步骤还会多一个 `task.upload` span 作为根节点
+（`document.parse`、`memory.build_context`、`rag` 各步都挂在它下面）。因为入队时记了
+`request_id`，用 `python trace_view.py app.log --request-id <原请求id>` 仍能把这棵树完整还原。
 
 ### 还原调用树（trace_view.py）
 

@@ -1,11 +1,17 @@
-# Chroma 向量库数据（本地运行时生成，勿提交）
+# Chroma 向量库数据（知识库三集合，本地运行时生成，勿提交）
 chroma_db/
 
-# 会话库（本地运行时生成，含 -wal / -shm 副本）
+# 旧 SQLite 会话库：数据已迁到 Redis，文件仅作留档，确认无误后可自行删除
 sessions.db*
 
 # 上传文档抽出的图片与描述缓存（本地运行时生成，勿提交）
 uploaded_images/
+
+# 上传任务排队期间的暂存文件（worker 处理完即删，勿提交）
+uploaded_files/
+
+# Redis 数据卷（docker run 挂载到 D:\bishe\.redis，勿提交）
+.redis/
 
 # RGB 评测数据集（第三方数据，由 rgb_eval.py 首次运行时下载）
 data/

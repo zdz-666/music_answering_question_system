@@ -1,14 +1,23 @@
 import document_loader
 import memory
 import rag
+import ratelimit
+import tasks
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from typing import Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
-from models import QueryRequest, ChatMessage, ChatResponse, ChatHistoryResponse
+from models import (
+    QueryRequest,
+    ChatMessage,
+    ChatResponse,
+    ChatHistoryResponse,
+    TaskStatusResponse,
+    UploadResponse,
+)
 from observability import (
     new_request_id,
     set_request_id,
@@ -30,7 +39,7 @@ from session_store import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 会话库建表并切到 WAL。每个 worker 启动时各跑一次，幂等。
+    # 启动自检：确认会话存储依赖的 Redis 可访问。每个 worker 启动时各跑一次，幂等。
     init_db()
     yield
 
@@ -66,11 +75,16 @@ async def request_logging(request, call_next):
     finally:
         reset_request_id(token)
 
-# 会话存储已外置到 SQLite（session_store.py）：跨 worker 共享、进程重启不丢。
+# 会话存储以 Redis 为准（session_store.py）：跨 worker 共享、进程重启不丢。
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(query: QueryRequest):
+async def chat(request: Request, query: QueryRequest):
 
     user_id = (query.user_id or "").strip()
+
+    # 限流放在最前面：一次 chat 要跑 6 次 LLM 加若干外部服务，被刷的代价最高。
+    # Redis 不可用时 ratelimit 内部直接放行，不会因为限流组件故障拒掉正常请求。
+    await ratelimit.enforce("chat", request, user_id)
+
     session_id = get_or_create_session(query.session_id)
     history_string = get_history_str(session_id)
 
@@ -132,78 +146,76 @@ async def delete_history(session_id: str):
     return {"message": "对话历史已删除",
             "session_id": session_id}
 
-@app.post("/api/upload", response_model=ChatResponse)
+@app.post("/api/upload", response_model=UploadResponse, status_code=202)
 async def upload_file(
+    request: Request,
+    response: Response,
     file: UploadFile = File(...),
     question: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
     user_id: Optional[str] = Form(None),
 ):
+    # 限流放在 file.read() 之前：上传要走 VLM 逐张识图，比 chat 更贵，
+    # 被反复上传的请求应该在读进内存、调模型之前就被拦下。
+    await ratelimit.enforce("upload", request, user_id)
+
     content = await file.read()
-
-    # 解析在 document_loader 里分发：PDF（PyMuPDF）/ DOCX（python-docx）/ 独立图片，
-    # 文档内嵌图与独立图片都会交给 VLM 转成中文描述，一起拼进 file_content。
-    # 读文件与逐张调 VLM 都是同步阻塞的，必须下沉线程池。
-    with log_step(
-        "document.parse",
-        input={"file": file.filename, "bytes": len(content)},
-    ) as parse_span:
-        try:
-            blocks = await run_in_threadpool(
-                document_loader.parse_document, file.filename, content
-            )
-        except document_loader.UnsupportedFormatError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"文件处理失败: {str(exc)}")
-
-        file_content = document_loader.blocks_to_text(blocks)
-        parse_span.output = {
-            "blocks": len(blocks),
-            "images": sum(1 for block in blocks if block.kind == "image"),
-            "chars": len(file_content),
-        }
-
-    query_request = QueryRequest(
-        question=question or "请分析上传的文件",
-        session_id=session_id,
-        file_content=file_content
-    )
-
     user_id = (user_id or "").strip()
-    session_id = get_or_create_session(query_request.session_id)
-    history_string = get_history_str(session_id)
 
-    # 与 /api/chat 同构：先取三层记忆，再交给检索与生成；上传场景的记忆检索同样要下沉线程池
-    with log_step(
-        "memory.build_context", session_id=session_id, user_id=user_id
-    ) as memory_span:
-        memory_string = await run_in_threadpool(
-            memory.build_context, user_id, session_id, query_request.question
-        )
-        memory_span.output = memory_string
-
-    with log_step(
-        "rag.total",
-        input={"question": query_request.question, "file": file.filename},
+    # 有 Redis 就入队，立刻返回 task_id（HTTP 202），解析与生成交给 worker.py；
+    # 没配 REDIS_URL / Redis 连不上时退回同步处理（status=done，答案直接带回来）。
+    # 队列是可选设施，不能让「没装 Redis」变成「上传不可用」——与缓存层同一条原则。
+    # 写暂存文件是阻塞 IO，一并下沉线程池。
+    task_id = await run_in_threadpool(
+        tasks.submit,
+        filename=file.filename,
+        content=content,
+        question=question,
         session_id=session_id,
-    ) as span:
-        result = await run_in_threadpool(
-            rag.get_result, query_request, history_string, memory_string
-        )
-        span.output = result.content
-
-    add_message(session_id, ChatMessage(role="user", content=f"已上传文件: {file.filename}" + (f"\n问题: {question}" if question else "")))
-    add_message(session_id, ChatMessage(role="assistant", content=result.content))
-
-    await run_in_threadpool(
-        memory.after_turn, user_id, session_id, query_request.question, result.content
+        user_id=user_id,
+        request_id=get_request_id(),
     )
+    if task_id:
+        return UploadResponse(status="queued", task_id=task_id)
 
-    return ChatResponse(
-        answer=result.content,
-        session_id=session_id,
-        timestamp=datetime.now().isoformat()
+    response.status_code = 200
+    try:
+        result = await run_in_threadpool(
+            rag.answer_with_file,
+            filename=file.filename,
+            content=content,
+            question=question,
+            session_id=session_id,
+            user_id=user_id,
+        )
+    except document_loader.UnsupportedFormatError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"文件处理失败: {str(exc)}")
+
+    return UploadResponse(status="done", **result)
+
+
+@app.get("/api/task/{task_id}", response_model=TaskStatusResponse)
+async def get_task(task_id: str):
+    """轮询异步任务状态：queued / running / done / failed。
+
+    任务记录存在 Redis 里（TTL 由 TASK_TTL_SECONDS 控制），过期后这里返回 404。
+    Redis 连不上时同样查不到 —— 此时 /api/upload 会走同步处理，本来也不产生任务。
+    """
+    record = await run_in_threadpool(tasks.load, task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=record.get("status", "queued"),
+        created_at=record.get("created_at"),
+        finished_at=record.get("finished_at"),
+        answer=record.get("answer"),
+        session_id=record.get("session_id"),
+        timestamp=record.get("timestamp"),
+        error=record.get("error"),
     )
 
 # 三个写入端点同样会阻塞：chunk_document 与 add_documents 内部要调 Embedding（网络往返），

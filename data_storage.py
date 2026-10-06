@@ -6,6 +6,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 
+import cache
 from config import CHROMA_PERSIST_DIR, get_embeddings
 from dynamic_chunk import SemanticChunker
 from observability import logger
@@ -49,6 +50,9 @@ def collection_create(url, collection_name):
             collection_name=collection_name,
             persist_directory=CHROMA_PERSIST_DIR,
 )
+
+    # 集合内容变了，该集合的检索缓存必须立刻作废（缓存的键里带着这个版本号）
+    cache.bump_kb_version(collection_name)
 
     if collection_name in list_collections():
         logger.info("collection.create", extra={"fields": {"collection": collection_name, "result": "success", "docs": len(split_docs)}})
@@ -132,6 +136,8 @@ def in_memory_similarity_search(documents: list, query, k):
 
 def drop_collection(collection_name):
     get_client().delete_collection(collection_name)
+    # 集合没了，它的检索缓存也不能再被命中
+    cache.bump_kb_version(collection_name)
 
     if collection_name in list_collections():
         logger.error("collection.drop", extra={"fields": {"collection": collection_name, "result": "failed"}})

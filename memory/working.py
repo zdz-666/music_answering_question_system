@@ -1,13 +1,13 @@
 """第一层记忆：工作记忆的摘要压缩。
 
-当前会话的消息由 session_store 存在 SQLite 里。条数超过 COMPRESS_TRIGGER 时，
-把最旧一批消息交给 LLM 合并进已有摘要，然后删除这批消息，让 messages 表始终只剩
+当前会话的消息由 session_store 存在 Redis 里。条数超过 COMPRESS_TRIGGER 时，
+把最旧一批消息交给 LLM 合并进已有摘要，然后删除这批消息，让会话始终只剩
 最近 HISTORY_WINDOW 条 —— 正好与注入 prompt 的窗口对齐，不会出现"摘要与最近几条
 之间漏掉一段"的空洞。
 
-压缩走两阶段，LLM 调用绝不放在事务里：
-    claim_compression  →  （事务外调 LLM）  →  commit_compression
-第二阶段的 commit 在同一个事务内写摘要 + 按 id 删除被覆盖的消息 + 释放认领，
+压缩走两阶段，LLM 调用绝不放在原子脚本里：
+    claim_compression  →  （脚本外调 LLM）  →  commit_compression
+第二阶段的 commit 由一段 Lua 脚本原子完成「写摘要 + 按 id 删除被覆盖的消息 + 释放认领 + 续期」，
 任一步失败都会 release 认领，下一轮对话再重试。
 """
 
