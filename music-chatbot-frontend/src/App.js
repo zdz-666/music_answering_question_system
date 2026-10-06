@@ -29,6 +29,7 @@ function App() {
   const [userId] = useState(getUserId);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadStage, setUploadStage] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileQuestion, setFileQuestion] = useState('');
   const [selfIntroduction, setSelfIntroduction] = useState('');
@@ -160,52 +161,78 @@ function App() {
   };
 
   // 处理文件上传
+  // 解析文档要逐张调视觉模型，几十张图的 PDF 可能跑几分钟，所以后端是异步的：
+  // 提交后立刻返回 task_id，这边轮询 /api/task/{id} 直到 done / failed。
+  // 没配 Redis 时后端退回同步处理，返回的 status 直接是 done，就不进轮询了。
+  const UPLOAD_POLL_INTERVAL_MS = 1500;
+  const UPLOAD_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+  const UPLOAD_STAGE_TEXT = { queued: '排队中...', running: '解析中...' };
+
+  const waitForUploadTask = async (taskId) => {
+    const deadline = Date.now() + UPLOAD_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, UPLOAD_POLL_INTERVAL_MS));
+      const task = await chatAPI.getTask(taskId);
+      if (task.status === 'done') return task;
+      if (task.status === 'failed') throw new Error(task.error || '文件处理失败');
+      setUploadStage(UPLOAD_STAGE_TEXT[task.status] || '处理中...');
+    }
+    throw new Error('处理超时，请刷新页面后到历史记录里查看');
+  };
+
   const handleFileUpload = async () => {
     if (!selectedFile) {
       alert('请先选择文件');
       return;
     }
 
-    setUploading(true);
-    try {
-      const response = await chatAPI.uploadFile(selectedFile, fileQuestion.trim() || null, sessionId, userId);
-      
-      let userContent = `已上传文件: ${selectedFile.name}`;
-      if (fileQuestion.trim()) {
-        userContent += `\n问题: ${fileQuestion.trim()}`;
-      }
-      
-      const userMessage = {
-        role: 'user',
-        content: userContent,
-        timestamp: new Date().toISOString(),
-      };
-      setMessages(prev => [...prev, userMessage]);
+    let userContent = `已上传文件: ${selectedFile.name}`;
+    if (fileQuestion.trim()) {
+      userContent += `\n问题: ${fileQuestion.trim()}`;
+    }
 
-      const aiMessage = {
+    setUploading(true);
+    setUploadStage('上传中...');
+    // 用户消息先上屏：解析要跑几分钟，等结束再显示会让人以为没点上
+    setMessages(prev => [...prev, {
+      role: 'user',
+      content: userContent,
+      timestamp: new Date().toISOString(),
+    }]);
+
+    try {
+      const submitted = await chatAPI.uploadFile(
+        selectedFile, fileQuestion.trim() || null, sessionId, userId
+      );
+      const result = submitted.status === 'done'
+        ? submitted
+        : await waitForUploadTask(submitted.task_id);
+
+      setMessages(prev => [...prev, {
         role: 'assistant',
-        content: response.answer,
-        timestamp: response.timestamp,
-      };
-      setMessages(prev => [...prev, aiMessage]);
-      
+        content: result.answer,
+        timestamp: result.timestamp,
+      }]);
+
       // 更新会话ID（后端会返回正确的session_id）
-      setSessionId(response.session_id);
-      
+      setSessionId(result.session_id);
+
       setSelectedFile(null);
       setFileQuestion('');
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
     } catch (error) {
-      const errorMessage = {
+      // 后端 4xx 的原因写在 detail 里（比如文件格式不支持），比笼统的"重试"有用
+      const detail = error?.response?.data?.detail || error?.message || '请稍后重试';
+      setMessages(prev => [...prev, {
         role: 'assistant',
-        content: '文件上传失败，请重试。',
+        content: `文件处理失败：${detail}`,
         timestamp: new Date().toISOString(),
-      };
-      setMessages(prev => [...prev, errorMessage]);
+      }]);
     } finally {
       setUploading(false);
+      setUploadStage('');
     }
   };
 
@@ -509,7 +536,7 @@ function App() {
                   disabled={!selectedFile || uploading}
                   className="upload-button"
                 >
-                  {uploading ? '上传中...' : '上传文件'}
+                  {uploading ? (uploadStage || '上传中...') : '上传文件'}
                 </button>
               </div>
               <textarea

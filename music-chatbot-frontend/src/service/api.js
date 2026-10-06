@@ -54,6 +54,8 @@ export const chatAPI = {
   // 上传文件
   // 传 sessionId / userId：上传也要落在同一个会话与同一个身份下，
   // 否则每上传一次都会新建会话，情景记忆的归属也会出错
+  // 返回两种形态：{status:'queued', task_id}（解析在 worker 里跑，需轮询 getTask）
+  //              {status:'done', answer, session_id, timestamp}（后端没 Redis，同步兜底直接给答案）
   async uploadFile(file, question = null, sessionId = null, userId = null) {
     try {
       const formData = new FormData();
@@ -76,6 +78,17 @@ export const chatAPI = {
       return response.data;
     } catch (error) {
       console.error('上传文件失败:', error);
+      throw error;
+    }
+  },
+
+  // 查询异步任务状态：status 为 queued / running / done / failed
+  async getTask(taskId) {
+    try {
+      const response = await api.get(`/api/task/${taskId}`);
+      return response.data;
+    } catch (error) {
+      console.error('查询任务状态失败:', error);
       throw error;
     }
   },
