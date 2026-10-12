@@ -11,7 +11,7 @@
 
 ## 功能特性
 
-- **agent_loop 工具调用**：一轮问答由模型自主决定「直接作答 / 调 `knowledge_base_search`（本地知识库）/ 调 `web_search`（联网搜索）/ 调 `read_file`（读记忆文件或压缩归档）/ 主动 `compact`（压缩历史）」。多个工具结果以 OpenAI 工具消息格式接回上下文，最多循环 `MAX_TOOL_ROUNDS`（8）轮，避免工具停不下来。「走知识库还是走网络」不再由单独的通道规划模型预先决定，而是模型在 loop 里按需选择。
+- **agent_loop 工具调用**：一轮问答由模型自主决定「直接作答 / 调 `knowledge_base_search`（本地知识库）/ 调 `web_search`（联网搜索）/ 调 `read_file`（读记忆文件或压缩归档）/ 主动 `compact`（压缩历史）」。多个工具结果以 OpenAI 工具消息格式接回上下文，最多循环 `MAX_TOOL_ROUNDS`（8）轮，避免工具停不下来。**停止条件不看「还有没有工具调用」**：模型不再调工具只代表它想停，此时会在返回边界过一道独立验收（`_judge_answer`，不挂工具、只读对话），判定「回答是否已充分回应用户问题」；不通过就把缺口作为 user 消息回灌、继续跑（最多 `ANSWER_BLOCK_CAP` 次），验收器故障或拦截到上限则带着当前答案收尾。「走知识库还是走网络」不再由单独的通道规划模型预先决定，而是模型在 loop 里按需选择。
 - **查询重写**：工具内部把口语化的用户提问改写为适合向量检索的正式查询；联网搜索前再单独做一次关键词净化。
 - **智能路由（Collection Router）**：由 LLM 判断问题应该落到哪个集合，支持多集合同时命中。
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%；重排服务不可用时退化为检索原序。
@@ -134,9 +134,12 @@ agent.run（agent.py）
          │       │     └─ compact               → 本轮工具执行后 compact_history
          │       │        结果作为 role="tool" 消息接回 → 继续 loop
          │       │
-         │       └─ 无 tool_calls → 这就是最终答案，结束
+         │       └─ 无 tool_calls → 返回边界：_judge_answer 独立验收（不挂工具，只读对话）
+         │              ├─ 通过   → 这就是最终答案，结束
+         │              └─ 不通过 → 把 missing 作为 user 消息回灌 → 继续 loop（最多 ANSWER_BLOCK_CAP 次）
          │
          ├─ 模型报「上下文过长」→ reactive_compact 后重试一次（MAX_REACTIVE_RETRIES）
+         ├─ 轮数耗尽仍在调工具 → 补一次不带工具的收尾（force_final），绝不返回空串
          └─ 结束后：压缩摘要写回会话（save_compaction）+ memory.learn 学习长期记忆
    │
    ▼
@@ -391,6 +394,7 @@ cp .env.example .env    # 然后填写 .env
 `CONTEXT_CHAR_LIMIT` / `TOOL_RESULT_BATCH_CHAR_LIMIT` / `LARGE_RESULT_CHAR_LIMIT` /
 `SUMMARY_INPUT_CHAR_LIMIT` / `KEEP_RECENT_RESULTS` / `KEEP_RECENT_MESSAGES` /
 `CONVERSATION_SNIP_LIMIT` / `TRANSCRIPT_DIR` / `TOOL_RESULTS_DIR` / `AGENT_HISTORY_LIMIT`（上下文压缩阈值与落盘目录）、
+`ANSWER_BLOCK_CAP`（返回边界答案验收连续拦截的上限，默认 3）、
 `RATE_LIMIT_ENABLED`（限流总开关，置 false 关闭）、`RATE_LIMIT_CHAT_*` / `RATE_LIMIT_UPLOAD_*`
 （两类接口令牌桶的容量与每秒补充速率）、
 `TASK_TTL_SECONDS`（上传任务记录存活秒数，默认 7200）、`UPLOAD_SPOOL_DIR`（上传任务排队期间的暂存目录）、
@@ -580,6 +584,8 @@ python llm_ev.py
 | `self_reflection.result` | 自反思过滤后的文本 | `content` |
 | `agent.run` / `agent.tool` | agent_loop 的整轮与每次工具调用 | `session_id`、`history`、`tool` |
 | `agent.reactive_compact` | 模型报「上下文过长」，即将反应式压缩后重试 | `step` |
+| `agent.answer_check` | 返回边界的答案验收（独立、不挂工具的模型） | `is_complete`、`missing` |
+| `agent.answer_check_failed` / `agent.answer_check_limit` / `agent.force_final` / `agent.force_final_failed` | 验收器故障（fail-open 收尾）/ 连续拦截达上限 / 轮数耗尽后的兜底收尾 | `error`、`blocks`、`cap` |
 | `agent.tool_failed` / `agent.memory_failed` / `agent.learn_failed` / `agent.save_compaction_failed` | agent 内的工具 / 记忆 / 压缩写回降级点，不打断回答 | `tool`、`error` |
 | `memory.learn` / `memory.recall_select` / `memory.extract` / `memory.consolidate` | 文件式记忆的抽取、召回选择与合并（`memory.learn` 是设置 span 的步骤） | `user_id`、`records`、`output` |
 | `memory.index_failed` / `memory.recall_failed` / `memory.recall_select_failed` / `memory.extract_failed` / `memory.consolidate_failed` / `memory.consolidate_skipped` | 记忆各步失败或跳过，已降级为「无记忆 / 不更新」 | `user_id`、`error`、`chars` |
@@ -599,7 +605,7 @@ python llm_ev.py
 | `worker.start` / `worker.no_redis` | worker 启动参数 / 拿不到 Redis 连接（此时上传走同步，队列用不上） | `once`、`detail` |
 
 **已埋点的步骤**：`request`（请求级）→ `rag.total`（RAG 链路汇总）→ `agent.run`（agent_loop 汇总）
-→ `agent.tool`（每次工具调用）、`collection_router`、`query_rewriting`、`vector_search`、`rerank`、
+→ `agent.tool`（每次工具调用）、`agent.answer_check`（返回边界答案验收）、`collection_router`、`query_rewriting`、`vector_search`、`rerank`、
 `web_search`、`web_rewriting`、`memory.recall_select`、`memory.extract`、`memory.consolidate`、
 `context.summarize`。
 

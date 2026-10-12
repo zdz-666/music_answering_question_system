@@ -112,6 +112,9 @@ TOOL_RESULTS_DIR = os.getenv("TOOL_RESULTS_DIR", "./.task_outputs/tool-results")
 # 压缩提交会按「已加载消息的最大 id」删除被摘要覆盖的那批，若这里截断就会删到
 # 没进摘要的旧消息，因此不要调得比 MAX_MESSAGES_HARD 小。
 AGENT_HISTORY_LIMIT = int(os.getenv("AGENT_HISTORY_LIMIT", "200"))
+# 返回边界上的答案验收（agent._judge_answer）：连续判定「未完成」的拦截上限，
+# 超过就带着当前答案收尾；评估器自身报错时也是直接收尾（fail-open），不空转。
+ANSWER_BLOCK_CAP = int(os.getenv("ANSWER_BLOCK_CAP", "3"))
 
 # ---- Redis（会话 / 缓存 / 限流 / 任务队列）----
 # 定位分两档，别混为一谈：
