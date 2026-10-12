@@ -207,8 +207,7 @@ def web_search(query: str) -> list:
     return results
 
 def get_web_search(query):
-        query_change = web_rewriting(query)
-        web_result = web_search(query_change)
+        web_result = web_search(query)
         return web_result
 
 def rerank(documents, query):
@@ -346,23 +345,22 @@ def get_vector_search(query, collection_list, external_docs=None) -> list:
     这批语料每次调用都不同且只在本次有效，因此不走缓存。
     """
     result = []
-    query_change = query_rewriting(query)
 
     if external_docs is not None:
         with log_step(
             "vector_search",
-            input=query_change,
+            input=query,
             corpus="external",
             docs=len(external_docs),
             k=6,
         ) as span:
-            vector_result = in_memory_similarity_search(external_docs, query_change, k=6)
+            vector_result = in_memory_similarity_search(external_docs, query, k=6)
             # Document 对象直接进日志会是 <Document ...> 这样的 repr，这里只取正文
             span.output = [doc.page_content for doc in vector_result]
-        return rerank(vector_result, query_change)
+        return rerank(vector_result, query)
 
     for co_name in collection_list:
-        result.extend(_cached_vector_search(co_name, query_change, 6))
+        result.extend(_cached_vector_search(co_name, query, 6))
 
     return result
 
