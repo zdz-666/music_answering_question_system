@@ -11,7 +11,7 @@
 
 ## 功能特性
 
-- **agent_loop 工具调用**：一轮问答由模型自主决定「直接作答 / 先调 `knowledge_base_search`（本地知识库）/ 调 `web_search`（联网搜索）/ 主动 `compact`（压缩历史）」。多个工具结果以 OpenAI 工具消息格式接回上下文，最多循环 `MAX_TOOL_ROUNDS`（8）轮，避免工具停不下来。「走知识库还是走网络」不再由单独的通道规划模型预先决定，而是模型在 loop 里按需选择。
+- **agent_loop 工具调用**：一轮问答由模型自主决定「直接作答 / 调 `knowledge_base_search`（本地知识库）/ 调 `web_search`（联网搜索）/ 调 `read_file`（读记忆文件或压缩归档）/ 主动 `compact`（压缩历史）」。多个工具结果以 OpenAI 工具消息格式接回上下文，最多循环 `MAX_TOOL_ROUNDS`（8）轮，避免工具停不下来。「走知识库还是走网络」不再由单独的通道规划模型预先决定，而是模型在 loop 里按需选择。
 - **查询重写**：工具内部把口语化的用户提问改写为适合向量检索的正式查询；联网搜索前再单独做一次关键词净化。
 - **智能路由（Collection Router）**：由 LLM 判断问题应该落到哪个集合，支持多集合同时命中。
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%；重排服务不可用时退化为检索原序。
@@ -68,6 +68,7 @@ bishe/
 ├── agent.py                # agent_loop 主循环：工具定义与执行、记忆注入、压缩写回、记忆学习
 ├── rag.py                  # 检索原语（重写/路由/混合检索/重排/联网/自反思）+ 格式化函数 + 评测链路
 ├── context_compact.py      # 上下文分级压缩（ContextCompactor：落盘 / 归档 / 微压缩 / 汇总）
+├── file_access.py          # read_file 工具的白名单读取（记忆目录 + 压缩归档，按 user_id 隔离，防路径穿越）
 ├── worker.py               # 上传任务消费者：独立进程从队列取任务，跑「解析 → agent 问答 → 落库」
 ├── tasks.py                # 任务队列原语：入队/取任务/状态读写、暂存文件、结果与 TTL
 ├── ratelimit.py            # 接口限流：Lua 令牌桶、按 user_id/IP 计数、Redis 不可用时放行
@@ -97,8 +98,8 @@ bishe/
 ├── uploaded_images/        # 上传文档抽出的图片与描述缓存（运行时生成，不入库）
 ├── uploaded_files/         # 上传任务排队期间的暂存文件（worker 处理完即删，不入库）
 ├── .memory/                # 长期记忆（按 user_id 分目录的 Markdown，运行时生成，不入库）
-├── .transcripts/           # 上下文压缩归档的对话 transcript（运行时生成，不入库）
-├── .task_outputs/          # 上下文压缩落盘的工具结果（运行时生成，不入库）
+├── .transcripts/           # 上下文压缩归档的对话 transcript（按 user_id 分子目录，运行时生成，不入库）
+├── .task_outputs/          # 上下文压缩落盘的工具结果（按 user_id 分子目录，运行时生成，不入库）
 ├── .redis/                 # Redis 容器数据卷（会话 / 缓存都在这，运行时生成，不入库；容器启动命令见下文）
 └── music-chatbot-frontend/ # React 前端
     └── src/
@@ -129,6 +130,7 @@ agent.run（agent.py）
          │       │     ├─ knowledge_base_search → 集合路由 → 查询重写
          │       │     │        └─ Chroma 稠密 + BM25 稀疏混合检索 (k=6) → Reranker 取前 50%
          │       │     ├─ web_search            → 关键词净化 → Tavily（5 条）
+         │       │     ├─ read_file             → 白名单校验 → 读记忆文件 / 压缩归档
          │       │     └─ compact               → 本轮工具执行后 compact_history
          │       │        结果作为 role="tool" 消息接回 → 继续 loop
          │       │
@@ -190,6 +192,8 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 记忆不再走向量检索，而是照 `memory_example.py` 那样落成一个个 Markdown 文件，按 `user_id` 分目录隔离：
 一个 `user_id` 一个目录（`MEMORY_ROOT/<safe_dir(user_id)>/`），目录里每条记忆一个 `.md`，
 外加一份 `MEMORY.md` 作为目录索引。记忆**只注入 system prompt**（不进入用户消息、也不参与检索链路），
+注入内容里除了召回到的正文，还会带上**记忆目录的绝对路径**与目录索引——模型据此可用 `read_file`
+工具按需精读任意一条记忆的完整正文（召回只注入相关记录的截断正文，精读用于补充细节）。
 且无 `user_id` 时整个记忆层跳过——`llm_ev.py` / `rgb_eval.py` 等离线评测因此完全不受影响。
 三步都各自容错、互不阻塞，任一步失败只打 warning，不影响回答返回。
 
@@ -232,8 +236,13 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 - **消息格式**：全程用 OpenAI 格式的 dict（`assistant.tool_calls` 承载调用，工具结果单独是一条
   `role="tool"` 消息），因此 `has_tool_use` / `is_tool_result` / `unseen_tool_result_positions` /
   `micro_compact` / `snip_compact` / `fit_tool_results` 全部按 OpenAI 格式实现。
-- **归档安全**：从占位文本解析出的落盘路径必须落在 `TOOL_RESULTS_DIR` / `TRANSCRIPT_DIR` 之内才认，
-  否则当作普通文本，避免被伪造路径带出目录。
+- **归档按用户隔离**：`ContextCompactor` 在 `TOOL_RESULTS_DIR` / `TRANSCRIPT_DIR` 之下再按
+  `safe_dir(user_id)` 分一层子目录（与长期记忆同一套命名）。归档里可能含用户隐私内容，因此和记忆一样
+  隔离；从占位文本解析出的落盘路径必须落在**当前用户自己的子目录**之内才认，否则当作普通文本，
+  避免被伪造路径带出目录、或跨读到别人的归档。
+- **归档可回读**：被压缩替换掉的内容可以用 `read_file` 工具读回——落盘工具结果是
+  `Full output: <路径>` 占位、中段归档是 `[N messages archived at <路径>]` 标记，路径就在占位文本里；
+  读取同样走白名单（只允许当前用户的记忆目录与这两个归档子目录），并受 `READ_FILE_CHAR_LIMIT` 截断。
 - 可调参数：`CONTEXT_CHAR_LIMIT`、`TOOL_RESULT_BATCH_CHAR_LIMIT`、`LARGE_RESULT_CHAR_LIMIT`、
   `SUMMARY_INPUT_CHAR_LIMIT`、`KEEP_RECENT_RESULTS`、`KEEP_RECENT_MESSAGES`、`CONVERSATION_SNIP_LIMIT`、
   `TRANSCRIPT_DIR`、`TOOL_RESULTS_DIR`（见 `.env.example`）。
@@ -378,6 +387,7 @@ cp .env.example .env    # 然后填写 .env
 `CACHE_TTL_*`（各层缓存的存活秒数）、
 `MEMORY_ROOT` / `MEMORY_RECALL_CHAR_LIMIT` / `MEMORY_RECALL_TOP_K` /
 `MEMORY_CONSOLIDATE_THRESHOLD` / `MEMORY_CONSOLIDATE_CHAR_LIMIT`（长期记忆目录与召回、合并阈值）、
+`READ_FILE_CHAR_LIMIT`（`read_file` 工具单次返回的字符上限，可读记忆目录与压缩归档）、
 `CONTEXT_CHAR_LIMIT` / `TOOL_RESULT_BATCH_CHAR_LIMIT` / `LARGE_RESULT_CHAR_LIMIT` /
 `SUMMARY_INPUT_CHAR_LIMIT` / `KEEP_RECENT_RESULTS` / `KEEP_RECENT_MESSAGES` /
 `CONVERSATION_SNIP_LIMIT` / `TRANSCRIPT_DIR` / `TOOL_RESULTS_DIR` / `AGENT_HISTORY_LIMIT`（上下文压缩阈值与落盘目录）、

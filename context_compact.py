@@ -49,6 +49,9 @@ from config import (
     get_chat_model,
 )
 from observability import log_step, logger
+# 复用记忆模块同一套 user_id → 目录名的映射，保证归档与记忆的隔离命名一致
+# （file_access.py 的白名单也用同一个 safe_dir，两边不会各自漂移）。
+from memory.store import safe_dir
 
 # 模型报「上下文过长」时最多再压缩重试几次
 MAX_REACTIVE_RETRIES = 1
@@ -61,15 +64,17 @@ _SAVED_PREFIX = "[Earlier tool result saved at "
 
 
 class ContextCompactor:
-    """一组按阈值触发的消息瘦身操作；实例只挂目录与「最近一次摘要」。"""
+    """一组按阈值触发的消息瘦身操作；实例只挂目录与「最近一次摘要」。
 
-    def __init__(
-        self,
-        transcript_dir: str | Path = TRANSCRIPT_DIR,
-        tool_results_dir: str | Path = TOOL_RESULTS_DIR,
-    ):
-        self.transcript_dir = Path(transcript_dir)
-        self.tool_results_dir = Path(tool_results_dir)
+    归档目录按 user_id 再分一层子目录（`<TOOL_RESULTS_DIR>/<safe_dir(user_id)>/`、
+    `<TRANSCRIPT_DIR>/<safe_dir(user_id)>/`）：落盘的 transcript 与工具结果里可能含有
+    用户隐私内容，和长期记忆一样按用户隔离，别的用户（或猜路径的读请求）拿不到。
+    """
+
+    def __init__(self, user_id: str = ""):
+        user_key = safe_dir(user_id)
+        self.transcript_dir = Path(TRANSCRIPT_DIR) / user_key
+        self.tool_results_dir = Path(TOOL_RESULTS_DIR) / user_key
         # 最近一次 compact 产生的摘要；agent 用它判断是否要把摘要写回会话。
         # 每次请求各自 new 一个实例，因此这里没有跨请求的并发问题。
         self.last_summary: str | None = None
@@ -368,6 +373,3 @@ class ContextCompactor:
                 logger.info("context.auto_compact", extra={"fields": {"chars": self.estimate_chars(messages)}})
                 messages = self.compact_history(messages, active_request)
         return messages
-
-
-COMPACTOR = ContextCompactor()

@@ -11,9 +11,10 @@
         没有         → 这就是最终答案，结束
     结束后：把压缩结果写回会话 + memory.learn 学习长期记忆
 
-工具三个：
+工具四个：
 - knowledge_base_search：复用 rag 的集合路由 + 混合检索 + 重排 + 自反思前的原始 chunk；
 - web_search：复用 rag 的联网搜索；
+- read_file：读该用户的记忆文件，或读回上下文压缩落盘/归档的原始内容；
 - compact：模型自己要一次上下文压缩。
 
 消息全程用 OpenAI 格式的 dict（assistant.tool_calls / role="tool"），这样既能直接交给
@@ -32,6 +33,7 @@ from config import CACHE_TTL_ANSWER, get_chat_model
 from context_compact import MAX_REACTIVE_RETRIES, ContextCompactor
 from observability import log_step, logger
 import cache
+import file_access
 import memory
 import session_store
 
@@ -43,6 +45,7 @@ SYSTEM = """你是一个专业的音乐知识问答助手，名为“乐典”�
 你可以调用工具来获取外部信息：
 - knowledge_base_search：检索本地知识库（音乐理解、歌单、自我介绍等）。当问题涉及具体曲目/作品/歌单/领域知识时使用。
 - web_search：联网搜索最新信息。当问题涉及时效性内容、新闻、最新动态时使用。
+- read_file：读取记忆文件或上下文压缩归档的内容。当系统提示里的记忆索引不够、需要看某条记忆的正文，或需要回读被压缩替换掉的结果时使用。
 - compact：当对话已经很长、上下文快放不下时，可以主动请求压缩历史。
 选择工具时给出简洁、精准的检索语句；不需要外部信息时直接凭自身知识作答，不要为了调用而调用。
 
@@ -90,6 +93,26 @@ def _tools() -> list[dict]:
         {
             "type": "function",
             "function": {
+                "name": "read_file",
+                "description": (
+                    "读取一个文件的完整内容。可读：本用户的记忆文件（记忆目录下的文件名，"
+                    "如 note.md）、以及上下文压缩占位文本里给出的归档路径。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "记忆目录下的文件名，或压缩占位文本里给出的绝对路径",
+                        }
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "compact",
                 "description": "当对话历史很长、上下文快放不下时，请求压缩历史以腾出空间。",
                 "parameters": {"type": "object", "properties": {}},
@@ -118,13 +141,15 @@ def _web_search(query: str) -> str:
     return rag.format_web_items(items)
 
 
-def _execute_tool(name: str, args: dict) -> str:
+def _execute_tool(name: str, args: dict, user_id: str) -> str:
     """按名字分发工具；未知工具与异常都返回可读文本，不打断 loop。"""
     try:
         if name == "knowledge_base_search":
             return _knowledge_base_search(str(args.get("query", "")).strip())
         if name == "web_search":
             return _web_search(str(args.get("query", "")).strip())
+        if name == "read_file":
+            return file_access.read_file(str(args.get("path", "")).strip(), user_id)
     except Exception as exc:  # noqa: BLE001 - 工具失败要让模型知道，而不是整轮报错
         logger.warning(
             "agent.tool_failed",
@@ -208,7 +233,7 @@ def run(
             logger.info("answer.cached", extra={"fields": {"question": question}})
             return cached
 
-    compactor = ContextCompactor()
+    compactor = ContextCompactor(user_id)
     llm = get_chat_model().bind_tools(TOOLS)
     reactive_retries = 0
     answer = ""
@@ -243,7 +268,9 @@ def run(
                     compact_requested = True
                 else:
                     with log_step("agent.tool", tool=call["name"]) as tool_span:
-                        output = _execute_tool(call["name"], call.get("args") or {})
+                        output = _execute_tool(
+                            call["name"], call.get("args") or {}, user_id
+                        )
                         tool_span.output = output
                 messages.append(
                     {"role": "tool", "tool_call_id": call["id"], "content": output}

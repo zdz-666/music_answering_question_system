@@ -84,6 +84,9 @@ MEMORY_CONSOLIDATE_THRESHOLD = int(os.getenv("MEMORY_CONSOLIDATE_THRESHOLD", "10
 MEMORY_CONSOLIDATE_CHAR_LIMIT = int(
     os.getenv("MEMORY_CONSOLIDATE_CHAR_LIMIT", "20000")
 )
+# read_file 工具（agent 读取记忆文件与压缩归档）单次返回的字符上限，
+# 避免把大文件整段灌进上下文；白名单目录见 file_access.py。
+READ_FILE_CHAR_LIMIT = int(os.getenv("READ_FILE_CHAR_LIMIT", "20000"))
 
 # ---- 上下文压缩（agent_loop 每轮调用前对聊天消息做瘦身）----
 # 阈值含义与 context_compact_example.py 一致，见 context_compact.py：
@@ -100,7 +103,8 @@ KEEP_RECENT_RESULTS = int(os.getenv("KEEP_RECENT_RESULTS", "3"))
 KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "5"))
 # snip 压缩的消息条数上限：超过就把中段归档成一份 transcript
 CONVERSATION_SNIP_LIMIT = int(os.getenv("CONVERSATION_SNIP_LIMIT", "50"))
-# 归档 transcript 与落盘工具结果的目录，已在 .gitignore 中排除
+# 归档 transcript 与落盘工具结果的目录，已在 .gitignore 中排除。
+# 运行时会在其下按 user_id 再分一层子目录（与记忆同一套 safe_dir 命名），见 context_compact.py。
 TRANSCRIPT_DIR = os.getenv("TRANSCRIPT_DIR", "./.transcripts")
 TOOL_RESULTS_DIR = os.getenv("TOOL_RESULTS_DIR", "./.task_outputs/tool-results")
 # 每次请求从 Redis 会话里加载的历史消息条数上限，作为 agent 的初始上下文。
