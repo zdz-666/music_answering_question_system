@@ -47,7 +47,7 @@ HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
 MAX_SUPPLEMENT_ROUNDS = int(os.getenv("MAX_SUPPLEMENT_ROUNDS", "2"))
 
 # Chroma 持久化目录：知识库（三个集合）的数据落在这里，已在 .gitignore 中排除。
-# 会话与记忆（情景记忆 / 用户画像）已迁到 Redis，不再占用这个目录。
+# 会话在 Redis、长期记忆在 MEMORY_ROOT 下的文件里，都不占用这个目录。
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 
 # ---- 对话模型成本（可选，用于日志里的 cost_usd 估算）----
@@ -66,30 +66,55 @@ IMAGE_MIN_SIZE = int(os.getenv("IMAGE_MIN_SIZE", "100"))
 # 抽取出的图片与描述缓存落盘目录，已在 .gitignore 中排除
 UPLOAD_IMAGE_DIR = os.getenv("UPLOAD_IMAGE_DIR", "./uploaded_images")
 
-# ---- 三层记忆（工作记忆 / 情景记忆 / 用户画像）----
-# 情景记忆：跨会话的历史问答，按 user_id 隔离 + 语义相似度检索
-# 用户画像：从对话里抽取的长期偏好与实体，一条一个原子事实
-# 两者都落在 Redis 的 RediSearch 向量索引上，索引名 {REDIS_KEY_PREFIX}:memidx:{COLLECTION}，
-# 见 memory/ft_index.py
-EPISODIC_COLLECTION = os.getenv("EPISODIC_COLLECTION", "episodic_memory")
-PROFILE_COLLECTION = os.getenv("PROFILE_COLLECTION", "user_profile")
-# 注入 prompt 的记忆条数上限
-EPISODIC_TOP_K = int(os.getenv("EPISODIC_TOP_K", "3"))
-PROFILE_TOP_K = int(os.getenv("PROFILE_TOP_K", "5"))
-# 单条记忆注入 prompt 时的截断长度，防止一条长回答把上下文挤爆
-MEMORY_SNIPPET_CHARS = int(os.getenv("MEMORY_SNIPPET_CHARS", "200"))
+# ---- 长期记忆（文件式，按 user_id 隔离）----
+# 记忆不再走向量检索，而是像 memory_example 那样落成一个个 Markdown 文件：
+# 一个 user_id 一个目录（MEMORY_ROOT/<safe_dir(user_id)>/），目录里每条记忆一个 .md，
+# 外加一份 MEMORY.md 目录索引。回答前用 LLM 从目录索引里挑出相关记忆拼进 system prompt，
+# 一轮结束后再抽取新的持久记忆落盘。详见 memory/ 包（store / recall / learn）。
+#
+# 记忆根目录：按 user_id 分目录存放，已在 .gitignore 中排除。
+MEMORY_ROOT = os.getenv("MEMORY_ROOT", "./.memory")
+# 单次注入 system prompt 的记忆正文总字符上限（recall 时按此截断）
+MEMORY_RECALL_CHAR_LIMIT = int(os.getenv("MEMORY_RECALL_CHAR_LIMIT", "20000"))
+# 单次最多召回几条记忆
+MEMORY_RECALL_TOP_K = int(os.getenv("MEMORY_RECALL_TOP_K", "5"))
+# 记忆条数达到该阈值时触发一次合并（consolidate），把重复/过时的记录整理掉
+MEMORY_CONSOLIDATE_THRESHOLD = int(os.getenv("MEMORY_CONSOLIDATE_THRESHOLD", "10"))
+# 合并时送入模型的目录正文上限；超过则跳过本次合并
+MEMORY_CONSOLIDATE_CHAR_LIMIT = int(
+    os.getenv("MEMORY_CONSOLIDATE_CHAR_LIMIT", "20000")
+)
 
-# 情景记忆的时间衰减：recency = exp(-EPISODIC_DECAY_FACTOR * age_hours / 24)
-# 0.1 时：1 天前约 0.90、1 周前约 0.50、1 个月前约 0.05（越近的对话越容易被召回）
-EPISODIC_DECAY_FACTOR = float(os.getenv("EPISODIC_DECAY_FACTOR", "0.1"))
-# 情景记忆的最终得分 = (1 - w) * 向量相似度 + w * 时间近因性
-EPISODIC_RECENCY_WEIGHT = float(os.getenv("EPISODIC_RECENCY_WEIGHT", "0.3"))
+# ---- 上下文压缩（agent_loop 每轮调用前对聊天消息做瘦身）----
+# 阈值含义与 context_compact_example.py 一致，见 context_compact.py：
+#   CONTEXT_CHAR_LIMIT       消息总量超过它就逐级压缩
+#   TOOL_RESULT_BATCH_CHAR_LIMIT  单批工具结果超过它就把超大结果落盘
+#   LARGE_RESULT_CHAR_LIMIT  单条工具结果的落盘门槛
+#   SUMMARY_INPUT_CHAR_LIMIT 汇总历史时送入模型的正文上限
+#   KEEP_RECENT_RESULTS      微压缩时保留最近几条工具结果原文
+CONTEXT_CHAR_LIMIT = int(os.getenv("CONTEXT_CHAR_LIMIT", "50000"))
+TOOL_RESULT_BATCH_CHAR_LIMIT = int(os.getenv("TOOL_RESULT_BATCH_CHAR_LIMIT", "200000"))
+LARGE_RESULT_CHAR_LIMIT = int(os.getenv("LARGE_RESULT_CHAR_LIMIT", "30000"))
+SUMMARY_INPUT_CHAR_LIMIT = int(os.getenv("SUMMARY_INPUT_CHAR_LIMIT", "80000"))
+KEEP_RECENT_RESULTS = int(os.getenv("KEEP_RECENT_RESULTS", "3"))
+KEEP_RECENT_MESSAGES = int(os.getenv("KEEP_RECENT_MESSAGES", "5"))
+# snip 压缩的消息条数上限：超过就把中段归档成一份 transcript
+CONVERSATION_SNIP_LIMIT = int(os.getenv("CONVERSATION_SNIP_LIMIT", "50"))
+# 归档 transcript 与落盘工具结果的目录，已在 .gitignore 中排除
+TRANSCRIPT_DIR = os.getenv("TRANSCRIPT_DIR", "./.transcripts")
+TOOL_RESULTS_DIR = os.getenv("TOOL_RESULTS_DIR", "./.task_outputs/tool-results")
+# 每次请求从 Redis 会话里加载的历史消息条数上限，作为 agent 的初始上下文。
+# 默认与 MAX_MESSAGES_HARD 对齐 = 一次把会话里现存的消息全加载进来：
+# 压缩提交会按「已加载消息的最大 id」删除被摘要覆盖的那批，若这里截断就会删到
+# 没进摘要的旧消息，因此不要调得比 MAX_MESSAGES_HARD 小。
+AGENT_HISTORY_LIMIT = int(os.getenv("AGENT_HISTORY_LIMIT", "200"))
 
-# ---- Redis（会话 / 记忆 / 缓存 / 限流 / 任务队列）----
+# ---- Redis（会话 / 缓存 / 限流 / 任务队列）----
 # 定位分两档，别混为一谈：
-#   必需 —— 会话（session_store）与记忆（memory/episodic、memory/profile）：
-#            拿不到连接就抛错，不做降级，因为它们承载的是数据本身；
+#   必需 —— 会话（session_store）：拿不到连接就抛错，不做降级，
+#            因为它承载的是数据本身（读不到历史会伪装成「新对话」的静默数据错误）；
 #   可选 —— 缓存 / 限流 / 上传队列：拿不到就静默退化（每次现算、限流放行、上传同步处理）。
+# 长期记忆已改为文件式（MEMORY_ROOT），不再占用 Redis。
 # 本地起实例的命令见 README。
 REDIS_URL = os.getenv("REDIS_URL", "")
 # 所有键的版本前缀。改这里的版本号（v1 → v2）即可让旧格式缓存整体失联，

@@ -1,8 +1,7 @@
-from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
+import agent
 import cache
 import document_loader
-import memory
 from collection_router import get_router_collection
 from models import ChatMessage, QueryRequest
 from dynamic_chunk import SemanticChunker
@@ -11,9 +10,8 @@ from data_storage import (
     load_vector_store,
     vector_similarity_search,
 )
-from session_store import add_message, get_history_str, get_or_create_session
+from session_store import add_message, get_or_create_session
 from config import (
-    CACHE_TTL_ANSWER,
     CACHE_TTL_LLM,
     CACHE_TTL_RETRIEVAL,
     HTTP_RETRIES,
@@ -547,7 +545,7 @@ def _retrieve_and_reflect(question: str, external_docs: list | None = None) -> s
 
 
 def _generate(prompt_template: str, variables: dict, **step_fields):
-    """格式化 prompt → 调 LLM → 写 span，返回 AIMessage（保持 get_result 的既有契约）。"""
+    """格式化 prompt → 调 LLM → 写 span，返回 AIMessage（供评测链路取 .content）。"""
     messages = ChatPromptTemplate.from_template(prompt_template).format_messages(**variables)
 
     llm = get_chat_model()
@@ -585,77 +583,20 @@ def self_reflection(query, vector_result, web_result):
     logger.info("self_reflection.result", extra={"fields": {"content": result.content}})
     return result.content
 
-def get_result(query: QueryRequest, history_string: str, memory_string: str = ""):
-     # 只有「没有历史、没有长期记忆、没有上传文件」时，整条链路才只由 question 决定，
-     # 这时按 question 缓存最终答案不会串味；否则同一个问题在不同会话、不同画像下
-     # 答案并不相同，用 question 当键会把 A 会话的答案喂给 B 会话。
-     name = (
-         cache.key("answer", cache.digest(query.question))
-         if not history_string and not memory_string and not query.file_content
-         else None
-     )
-     if name:
-         cached = cache.get_json(name)
-         if cached is not None:
-             logger.info(
-                 "answer.cached",
-                 extra={"fields": {"question": query.question, "chars": len(cached)}},
-             )
-             return AIMessage(content=cached)
+def get_result(query: QueryRequest, session_id: str) -> str:
+    """问答入口：交给 agent_loop（工具调用 + 记忆 + 上下文压缩），返回答案文本。
 
-     # 检索通道（知识库 / 网络）改由 retrieval_planner 依据提问自动决定，
-     # 不再读 query 上的开关字段。
-     context = _retrieve_and_reflect(query.question)
+    原先这里自己拼 prompt、把历史与记忆当模板变量塞进去；现在这些都下沉到 agent：
+    历史由 agent 从会话加载，记忆注入 system prompt，检索变成工具，上下文超限自动压缩。
+    评测链路（get_result_evaluate / _retrieve_and_reflect）不走这里，保持原样。
+    """
+    return agent.run(
+        query.question,
+        session_id=session_id,
+        user_id=(query.user_id or "").strip(),
+        file_content=query.file_content,
+    )
 
-     # 三层记忆由 memory 包拼好后从外部注入，检索链路本身不感知记忆的存在。
-     # 没有记忆时不渲染标题，避免 prompt 里出现一个空段落。
-     memory_block = (
-         "\n关于该用户的长期记忆（跨会话，供个性化参考，可能与本次提问无关，请谨慎使用）：\n"
-         f"{memory_string}\n"
-         if memory_string
-         else ""
-     )
-
-     prompt_template = """
-        你是一个专业的音乐知识问答助手，名为“乐典”。你的核心职责是准确、专业、清晰地回答用户关于音乐的一切问题。
-        理解与分析：仔细分析用户输入的问题，明确其核心意图和所需的知识范畴。
-        用户之前的聊天记录：{history_string}
-        {memory_block}
-        信息检索与整合：
-        融合信息：将内部知识、网络搜索结果以及知识库信息进行智能比对、验证与融合，形成完整的答案。
-
-        组织与输出：你的回答应当结构清晰、重点突出、语言友好。
-        输出格式要求（必须严格遵守，前端会按 Markdown 渲染）：
-        - 始终使用 Markdown 格式组织回答，不要输出大段无结构的纯文本。
-        - 小节标题使用 ## 或 ###，不要使用一级标题 #。
-        - 并列的内容使用无序列表（- ），有先后顺序的内容使用有序列表（1. 2. 3.）。
-        - 关键术语、曲名、作品名、人名使用 **加粗** 强调，但不要整段加粗。
-        - 需要横向对比多项内容时，使用 Markdown 表格呈现。
-        - 引用原文或他人观点时使用 > 引用块。
-        - 直接输出 Markdown 正文本身，严禁把整个回答包裹在 ``` 代码块中。
-
-        用户的问题是：{question}
-        用户上传的文件内容是：{file_content}
-        与用户提问相关的信息是：{context}
-        """
-     result = _generate(
-         prompt_template,
-         {
-             "question": query.question,
-             "history_string": history_string,
-             "memory_block": memory_block,
-             "file_content": query.file_content,
-             "context": context,
-         },
-         has_file=bool(query.file_content),
-         has_memory=bool(memory_string),
-     )
-
-     # 只缓存正文：AIMessage 上的 usage_metadata 是从缓存里还原不出来的，
-     # 硬造一份反而会让日志里的 token 统计变成假数据。
-     if name:
-         cache.set_json(name, result.content, CACHE_TTL_ANSWER)
-     return result
 
 def answer_with_file(
     filename: str,
@@ -664,7 +605,7 @@ def answer_with_file(
     session_id: str | None,
     user_id: str,
 ) -> dict:
-    """上传文件的完整问答流程：解析 → 取记忆 → 检索生成 → 落会话 → 写记忆。
+    """上传文件的完整问答流程：解析 → agent 问答 → 落会话。
 
     这段编排原先写在 main.upload_file 里。上传改成异步任务后 worker 也要跑同一套流程，
     留在入口层就会变成一份逻辑两个副本（而「同步兜底」这条路两个入口都要用），
@@ -686,22 +627,13 @@ def answer_with_file(
             "chars": len(file_content),
         }
 
-    query_request = QueryRequest(
-        question=question or "请分析上传的文件",
+    session_id = get_or_create_session(session_id)
+    answer = agent.run(
+        question or "请分析上传的文件",
         session_id=session_id,
+        user_id=(user_id or "").strip(),
         file_content=file_content,
     )
-
-    session_id = get_or_create_session(query_request.session_id)
-    history_string = get_history_str(session_id)
-
-    with log_step(
-        "memory.build_context", session_id=session_id, user_id=user_id
-    ) as memory_span:
-        memory_string = memory.build_context(user_id, session_id, query_request.question)
-        memory_span.output = memory_string
-
-    result = get_result(query_request, history_string, memory_string)
 
     add_message(
         session_id,
@@ -711,12 +643,10 @@ def answer_with_file(
             + (f"\n问题: {question}" if question else ""),
         ),
     )
-    add_message(session_id, ChatMessage(role="assistant", content=result.content))
-
-    memory.after_turn(user_id, session_id, query_request.question, result.content)
+    add_message(session_id, ChatMessage(role="assistant", content=answer))
 
     return {
-        "answer": result.content,
+        "answer": answer,
         "session_id": session_id,
         "timestamp": datetime.now().isoformat(),
     }

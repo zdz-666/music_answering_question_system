@@ -1,5 +1,4 @@
 import document_loader
-import memory
 import rag
 import ratelimit
 import tasks
@@ -29,7 +28,6 @@ from observability import (
 from session_store import (
     add_message,
     clear_messages,
-    get_history_str,
     get_or_create_session,
     get_summary,
     init_db,
@@ -81,41 +79,27 @@ async def chat(request: Request, query: QueryRequest):
 
     user_id = (query.user_id or "").strip()
 
-    # 限流放在最前面：一次 chat 要跑 6 次 LLM 加若干外部服务，被刷的代价最高。
+    # 限流放在最前面：一次 chat 要跑多次 LLM 加若干外部服务，被刷的代价最高。
     # Redis 不可用时 ratelimit 内部直接放行，不会因为限流组件故障拒掉正常请求。
     await ratelimit.enforce("chat", request, user_id)
 
     session_id = get_or_create_session(query.session_id)
-    history_string = get_history_str(session_id)
 
-    # 情景记忆 / 用户画像的相似度检索要走 Embedding 网络往返，必须下沉线程池
-    with log_step(
-        "memory.build_context", session_id=session_id, user_id=user_id
-    ) as memory_span:
-        memory_string = await run_in_threadpool(
-            memory.build_context, user_id, session_id, query.question
-        )
-        memory_span.output = memory_string
-
-    # rag.get_result 是同步阻塞函数（内部是同步 LLM / requests / Chroma 调用），
+    # rag.get_result 内部走 agent_loop（同步阻塞：LLM / 检索 / 网络 / Redis），
     # 直接在 async 端点里调用会占住事件循环，同一 worker 上的其它请求全部排队。
-    # 下沉到线程池后本进程才能并发处理请求；request_id 与 token 计量靠 contextvars 传递。
+    # 历史加载、记忆注入、工具检索与上下文压缩都在 agent 内部完成；
+    # request_id 与 token 计量靠 contextvars 传递。
     with log_step("rag.total", input=query.question, session_id=session_id) as span:
-        result = await run_in_threadpool(
-            rag.get_result, query, history_string, memory_string
-        )
-        span.output = result.content
+        answer = await run_in_threadpool(rag.get_result, query, session_id)
+        span.output = answer
 
+    # 本轮的问答在 agent 返回后再落库：agent 是在「本轮提问落库之前」加载的历史，
+    # 这样当前提问不会被重复计入上下文。
     add_message(session_id, ChatMessage(role="user", content=query.question))
-    add_message(session_id, ChatMessage(role="assistant", content=result.content))
-
-    # 一轮结束后更新记忆：压缩工作记忆（LLM）+ 写情景记忆/画像（Embedding），同样是阻塞操作
-    await run_in_threadpool(
-        memory.after_turn, user_id, session_id, query.question, result.content
-    )
+    add_message(session_id, ChatMessage(role="assistant", content=answer))
 
     response = ChatResponse(
-        answer=result.content,
+        answer=answer,
         session_id=session_id,
         timestamp=datetime.now().isoformat()
     )
