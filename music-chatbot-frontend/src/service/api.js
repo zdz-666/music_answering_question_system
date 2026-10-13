@@ -10,6 +10,28 @@ const api = axios.create({
 
 // API 调用函数
 export const chatAPI = {
+  // 注册：成功返回 { user_id, username }；账号已存在时后端回 409
+  async register(username, password) {
+    try {
+      const response = await api.post('/api/auth/register', { username, password });
+      return response.data;
+    } catch (error) {
+      console.error('注册失败:', error);
+      throw error;
+    }
+  },
+
+  // 登录：成功返回 { user_id, username }；账号或密码不对时后端回 401
+  async login(username, password) {
+    try {
+      const response = await api.post('/api/auth/login', { username, password });
+      return response.data;
+    } catch (error) {
+      console.error('登录失败:', error);
+      throw error;
+    }
+  },
+
   // 发送消息
   // 是否走知识库/网络检索由后端模型依据提问决定，前端不再传开关
   // userId：用户身份，后端按它隔离情景记忆与用户画像（跨会话记忆的前提）
@@ -36,6 +58,20 @@ export const chatAPI = {
       return response.data;
     } catch (error) {
       console.error('获取历史记录失败:', error);
+      throw error;
+    }
+  },
+
+  // 列出该用户名下的历史会话（最近活跃在前），供侧边栏渲染。
+  // 返回 { sessions: [{session_id, title, created_at, updated_at}], total }
+  async listSessions(userId, number = 20) {
+    try {
+      const response = await api.get('/api/sessions', {
+        params: { user_id: userId, number }
+      });
+      return response.data;
+    } catch (error) {
+      console.error('获取会话列表失败:', error);
       throw error;
     }
   },

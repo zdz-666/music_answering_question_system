@@ -431,7 +431,8 @@ def answer_with_file(
             "chars": len(file_content),
         }
 
-    session_id = get_or_create_session(session_id)
+    # user_id 一并传入：上传走到的会话也要挂到该用户名下的索引，侧边栏才列得出来
+    session_id = get_or_create_session(session_id, (user_id or "").strip())
     answer = agent.run(
         question or "请分析上传的文件",
         session_id=session_id,

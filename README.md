@@ -65,7 +65,8 @@
 
 ```
 bishe/
-├── main.py                 # FastAPI 入口，路由、文件上传（会话已外置到 session_store.py）
+├── main.py                 # FastAPI 入口，路由、账号接口、文件上传（会话已外置到 session_store.py）
+├── auth.py                 # 账号体系：注册/登录换 user_id（pbkdf2 加盐哈希，账号存 Redis）
 ├── agent.py                # agent_loop 主循环：工具定义与执行（含子智能体 task）、记忆注入、压缩写回、记忆学习
 ├── rag.py                  # 在线链路用的检索原语（重写/路由/混合检索/重排/联网）+ 格式化函数 + 问答入口
 ├── rag_pipeline.py         # 改造前的旧 RAG 管道（通道规划 → 检索 → 补充检索 → 自反思 → 生成），只服务离线评测
@@ -180,9 +181,11 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 
 | 键 | 类型 | 内容 |
 | --- | --- | --- |
-| `{prefix}:sess:{id}:meta` | HASH | `created_at` / `updated_at` / `next_id`（消息自增 id） |
+| `{prefix}:sess:{id}:meta` | HASH | `created_at` / `updated_at` / `next_id`（消息自增 id）/ `user_id`（会话归属）/ `title`（首条用户消息截断） |
 | `{prefix}:sess:{id}:msgs` | LIST | 消息，元素是 JSON `{id, role, content, timestamp}` |
 | `{prefix}:sess:{id}:sum` | STRING | 压缩摘要（由 agent 的压缩结果写入，见「上下文压缩」） |
+| `{prefix}:sess:user:{digest(user_id)}:index` | ZSET | 该用户名下的会话索引（member = `session_id`，score = 最近活跃时间），供 `GET /api/sessions` 渲染侧边栏 |
+| `{prefix}:user:{digest(username)}` | HASH | 账号记录：`user_id` / `username` / `salt` / `password_hash`（pbkdf2 加盐哈希）/ `created_at`；不设 TTL |
 
 - **会话是正确性依赖，不是缓存**：缓存 / 限流 / 队列拿不到 Redis 可以降级，会话不行——
   降级只会把「读不到历史」伪装成「这是一段新对话」，属于静默的数据错误。因此这里取连接用
@@ -338,9 +341,12 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| POST | `/api/auth/register` | 注册账号（`{username, password}`），返回该账号的 `user_id`；账号已存在返回 409 |
+| POST | `/api/auth/login` | 登录（`{username, password}`），返回该账号的 `user_id`；账号或密码不对返回 401 |
 | POST | `/api/chat` | 发送消息，返回答案与 `session_id` |
 | GET | `/api/chat/history/{session_id}` | 查询会话历史（`number` 可选，默认 20） |
 | DELETE | `/api/chat/history/{session_id}` | 清空指定会话历史 |
+| GET | `/api/sessions` | 按 `user_id` 列出其名下的历史会话（最近活跃在前，`number` 可选、默认 20），供前端侧边栏渲染；`user_id` 必填 |
 | POST | `/api/upload` | 上传 `.pdf` / `.docx` / 图片（`.png` `.jpg` `.jpeg` `.gif` `.webp`）并提问（含图片描述），其它格式返回 400。有 Redis 时返回 `202` + `task_id`（202 表示已入队，不是已完成），无 Redis 时退回同步处理、返回 `200` + 答案 |
 | GET | `/api/task/{task_id}` | 轮询上传任务：`status` 为 `queued` / `running` / `done` / `failed`，`done` 带答案，`failed` 带 `error`；任务不存在或已过期返回 404 |
 | POST | `/api/knowledge/self-introduction` | 写入个人信息 |

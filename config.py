@@ -118,6 +118,11 @@ ANSWER_BLOCK_CAP = int(os.getenv("ANSWER_BLOCK_CAP", "3"))
 # 子智能体（父智能体的 task 工具）自己那条 agent loop 的轮数上限
 SUBAGENT_MAX_ROUNDS = int(os.getenv("SUBAGENT_MAX_ROUNDS", "10"))
 
+# ---- 账号（auth.py：用户名 + 密码换 user_id）----
+# pbkdf2-hmac-sha256 的迭代次数。调高更抗暴力破解、但每次登录/注册都更慢；
+# 默认 10 万次在本机约几十毫秒，登录体验与强度都够用。
+AUTH_PBKDF2_ITERATIONS = int(os.getenv("AUTH_PBKDF2_ITERATIONS", "100000"))
+
 # ---- Redis（会话 / 缓存 / 限流 / 任务队列）----
 # 定位分两档，别混为一谈：
 #   必需 —— 会话（session_store）：拿不到连接就抛错，不做降级，

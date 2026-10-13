@@ -93,6 +93,32 @@ body {
   color: var(--text-muted);
 }
 
+/* 顶栏右侧的当前账号 + 退出登录（推到最后一行最右端） */
+.header-user {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-left: auto;
+}
+
+.header-username {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.btn-logout {
+  padding: 0.35rem 0.7rem;
+  font-size: 0.8rem;
+}
+
 .main-container {
   display: flex;
   flex: 1;
@@ -174,38 +200,84 @@ body {
   border-color: #e8a49a;
 }
 
+/* 现在只剩「新会话」「清空历史」两个按钮，各占满一行 */
+.session-controls .btn-danger {
+  grid-column: span 2;
+}
+
 .btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
-.session-info {
+/* 历史会话列表（侧边栏导航） */
+.session-list-section {
   margin-bottom: 1.25rem;
 }
 
-.session-info h4 {
+.session-list-section h4 {
   font-size: 0.8rem;
   font-weight: 600;
   margin-bottom: 0.4rem;
   color: var(--text-muted);
 }
 
-.session-input {
-  width: 100%;
-  padding: 0.45rem 0.7rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  font-family: inherit;
-  font-size: 0.85rem;
-  font-variant-numeric: tabular-nums;
-  margin-bottom: 0.35rem;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+.session-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  margin-bottom: 0.9rem;
 }
 
-.session-input:focus {
-  outline: none;
+.session-list-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.session-list-item:hover {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+}
+
+.session-list-item.active {
+  background: var(--accent-soft);
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.session-item-title {
+  font-size: 0.85rem;
+  color: var(--text);
+  line-height: 1.35;
+  /* 标题最多两行，超出省略，避免长问题把列表撑变形 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.session-list-item.active .session-item-title {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.session-item-time {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .session-hint {
@@ -836,6 +908,105 @@ body {
   30% {
     transform: translateY(-4px);
   }
+}
+
+/* 登录页：卡片居中，与主界面共用同一套配色变量 */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: var(--bg);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  padding: 2rem 1.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+}
+
+.login-card h1 {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  font-size: 1.3rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin-bottom: 0.35rem;
+}
+
+.login-subtitle {
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 1.5rem;
+}
+
+.login-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem;
+}
+
+.login-input {
+  width: 100%;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 0.9rem;
+  background: var(--surface);
+  color: var(--text);
+  margin-bottom: 1rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.login-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.login-error {
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.9rem;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 0.82rem;
+}
+
+/* 登录 / 注册按钮：占满整行 */
+.login-submit {
+  width: 100%;
+  padding: 0.65rem;
+  font-size: 0.92rem;
+}
+
+.login-switch {
+  margin-top: 0.9rem;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.login-switch:hover {
+  color: var(--accent-hover);
 }
 
 /* 响应式：中等屏幕收窄侧边栏 */

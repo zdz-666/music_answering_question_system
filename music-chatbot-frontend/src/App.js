@@ -1,32 +1,154 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { chatAPI } from './service/api.js';
 import './App.css';
 
-// 用户身份：后端按它隔离情景记忆与用户画像（"跨会话"= 同一 user_id 的多个会话）。
-// 生成一次后写进 localStorage，刷新页面仍保持同一身份，记忆才不会断。
+// 登录态：账号 → user_id 的映射由后端 auth.py 维护，前端只保存登录结果
+// （user_id + 账号名，不存密码）。刷新页面仍是同一个人，会话与跨会话记忆才连得上。
 const USER_ID_KEY = 'music_rag_user_id';
+const USERNAME_KEY = 'music_rag_username';
 
-function getUserId() {
+function readIdentity() {
   try {
-    let id = localStorage.getItem(USER_ID_KEY);
-    if (!id) {
-      id = `user_${Math.random().toString(36).slice(2, 10)}`;
-      localStorage.setItem(USER_ID_KEY, id);
-    }
-    return id;
+    return {
+      userId: localStorage.getItem(USER_ID_KEY) || '',
+      username: localStorage.getItem(USERNAME_KEY) || '',
+    };
   } catch (error) {
-    // localStorage 不可用（隐私模式等）时退化成一次性身份，功能仍可用
-    return `user_${Math.random().toString(36).slice(2, 10)}`;
+    // localStorage 不可用（隐私模式等）时按未登录处理，用户当场登录即可
+    return { userId: '', username: '' };
   }
+}
+
+function persistIdentity(userId, username) {
+  try {
+    localStorage.setItem(USER_ID_KEY, userId);
+    localStorage.setItem(USERNAME_KEY, username);
+  } catch (error) {
+    // 存不下也不阻断本次使用，只是刷新后需要重新登录
+  }
+}
+
+function clearIdentity() {
+  try {
+    localStorage.removeItem(USER_ID_KEY);
+    localStorage.removeItem(USERNAME_KEY);
+  } catch (error) {
+    // 忽略：清不掉也能通过页面上的退出按钮回到登录页
+  }
+}
+
+// 登录页：登录 / 注册共用一张表单，成功后把 { user_id, username } 交给 App。
+function LoginPage({ onAuthenticated }) {
+  const [mode, setMode] = useState('login');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const isRegister = mode === 'register';
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    if (submitting) return;
+    setError('');
+    setSubmitting(true);
+    try {
+      const result = isRegister
+        ? await chatAPI.register(username, password)
+        : await chatAPI.login(username, password);
+      onAuthenticated(result.user_id, result.username);
+    } catch (err) {
+      // 后端的报错（账号已存在 / 账号或密码不正确 / 用户名格式…）原样展示，别自己改写
+      const detail = err?.response?.data?.detail;
+      setError(typeof detail === 'string' ? detail : '请求失败，请稍后重试');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="login-page">
+      <form className="login-card" onSubmit={handleSubmit}>
+        <h1>
+          <span className="brand-mark" aria-hidden="true">♪</span>
+          乐典音乐助手
+        </h1>
+        <p className="login-subtitle">
+          {isRegister ? '注册一个新账号' : '登录后继续你的对话'}
+        </p>
+
+        <label className="login-label" htmlFor="login-username">账号</label>
+        <input
+          id="login-username"
+          className="login-input"
+          type="text"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          placeholder="3-32 位字母、数字、下划线、点或连字符"
+          autoComplete="username"
+          required
+        />
+
+        <label className="login-label" htmlFor="login-password">密码</label>
+        <input
+          id="login-password"
+          className="login-input"
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder={isRegister ? '至少 6 位' : '请输入密码'}
+          autoComplete={isRegister ? 'new-password' : 'current-password'}
+          required
+        />
+
+        {error && <p className="login-error">{error}</p>}
+
+        <button type="submit" className="btn btn-primary login-submit" disabled={submitting}>
+          {submitting ? '处理中…' : isRegister ? '注册并登录' : '登录'}
+        </button>
+
+        <button
+          type="button"
+          className="login-switch"
+          onClick={() => {
+            setMode(isRegister ? 'login' : 'register');
+            setError('');
+          }}
+        >
+          {isRegister ? '已有账号？去登录' : '没有账号？去注册'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+// 会话列表里每条记录的时间显示（后端给的是 ISO 字符串，解析失败就留空）
+function formatSessionTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleString([], {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function App() {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [sessionId, setSessionId] = useState('');
-  const [userId] = useState(getUserId);
+  const [sessions, setSessions] = useState([]);
+  // 登录态：必须有 user_id 和账号名才算登录（两个一起写、一起清）。
+  // 只认到旧版的匿名 user_id（改造前随机生成、没有账号名）也当作未登录，重新登录一次，
+  // 否则旧身份会绕过登录页，用户会以为登录界面没生效。
+  const [identity, setIdentity] = useState(readIdentity);
+  const userId = identity.userId;
+  const username = identity.username;
+  const loggedIn = Boolean(userId && username);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadStage, setUploadStage] = useState('');
@@ -48,6 +170,40 @@ function App() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // 会话列表：侧边栏导航用。拉取失败就退化成空列表，不影响问答主链路。
+  const refreshSessions = useCallback(async () => {
+    if (!userId) {
+      setSessions([]);
+      return;
+    }
+    try {
+      const data = await chatAPI.listSessions(userId);
+      setSessions(data.sessions || []);
+    } catch (error) {
+      setSessions([]);
+    }
+  }, [userId]);
+
+  // 进页面（或换账号登录后）就列出该账号名下的历史会话
+  useEffect(() => {
+    refreshSessions();
+  }, [refreshSessions]);
+
+  // 登录 / 注册成功：记下身份，主界面随即渲染并拉取该账号的会话列表
+  const handleAuthenticated = (newUserId, newUsername) => {
+    persistIdentity(newUserId, newUsername);
+    setIdentity({ userId: newUserId, username: newUsername });
+  };
+
+  // 退出登录：清掉本地身份并复位界面，不删服务端任何数据
+  const handleLogout = () => {
+    clearIdentity();
+    setIdentity({ userId: '', username: '' });
+    setSessionId('');
+    setMessages([]);
+    setSessions([]);
+  };
 
   // 处理发送消息
   const handleSendMessage = async () => {
@@ -82,6 +238,8 @@ function App() {
         timestamp: response.timestamp,
       };
       setMessages(prev => [...prev, aiMessage]);
+      // 新一轮问答后刷新侧边栏：新会话要出现，已有会话要按最近活跃排到最前
+      refreshSessions();
     } catch (error) {
       // 显示错误消息
       const errorMessage = {
@@ -103,25 +261,27 @@ function App() {
     }
   };
 
-  // 加载历史记录
-  const handleLoadHistory = async () => {
-    if (!sessionId) {
-      alert('请输入会话ID');
-      return;
-    }
+  // 把某段会话的历史载入主区域（后端会把较早轮次压缩成摘要，一并展示，
+  // 避免"加载历史后只剩最后几条"）
+  const loadSessionHistory = async (id) => {
+    const response = await chatAPI.getHistory(id);
+    const historyMessages = response.messages || [];
+    const summaryMessage = response.summary
+      ? [{
+          role: 'assistant',
+          content: `【此前对话摘要】\n${response.summary}`,
+          timestamp: response.timestamp,
+        }]
+      : [];
+    setMessages([...summaryMessage, ...historyMessages]);
+  };
 
+  // 点击侧边栏一条会话：切到该会话并载入它的历史；之后继续发送就接在这段对话上
+  const handleOpenSession = async (id) => {
+    if (id === sessionId) return;
+    setSessionId(id);
     try {
-      const response = await chatAPI.getHistory(sessionId);
-      const historyMessages = response.messages || [];
-      // 后端会把较早轮次压缩成摘要，一并展示，避免"加载历史后只剩最后几条"
-      const summaryMessage = response.summary
-        ? [{
-            role: 'assistant',
-            content: `【此前对话摘要】\n${response.summary}`,
-            timestamp: response.timestamp,
-          }]
-        : [];
-      setMessages([...summaryMessage, ...historyMessages]);
+      await loadSessionHistory(id);
     } catch (error) {
       alert('加载历史记录失败');
     }
@@ -216,6 +376,8 @@ function App() {
 
       // 更新会话ID（后端会返回正确的session_id）
       setSessionId(result.session_id);
+      // 上传问答同样会新建/更新会话，侧边栏跟着刷新
+      refreshSessions();
 
       setSelectedFile(null);
       setFileQuestion('');
@@ -284,6 +446,11 @@ function App() {
     }
   };
 
+  // 未登录：只渲染登录页。会话、记忆都挂在账号上，没身份就没有可展示的内容。
+  if (!loggedIn) {
+    return <LoginPage onAuthenticated={handleAuthenticated} />;
+  }
+
   return (
     <div className="app">
       <header className="header">
@@ -292,6 +459,12 @@ function App() {
           乐典音乐助手
         </h1>
         <p className="subtitle">专注音乐领域的知识问答系统</p>
+        <div className="header-user">
+          <span className="header-username" title={userId}>{username}</span>
+          <button type="button" className="btn btn-secondary btn-logout" onClick={handleLogout}>
+            退出登录
+          </button>
+        </div>
       </header>
 
       <div className="main-container">
@@ -307,29 +480,44 @@ function App() {
                 新会话
               </button>
               <button 
-                onClick={handleLoadHistory}
-                className="btn btn-secondary"
-              >
-                加载历史
-              </button>
-              <button 
                 onClick={handleClearHistory}
                 className="btn btn-danger"
               >
                 清空历史
               </button>
             </div>
-            
-            <div className="session-info">
-              <h4>会话ID</h4>
-              <input
-                type="text"
-                value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
-                placeholder="输入或自动生成会话ID"
-                className="session-input"
-              />
-              <p className="session-hint">修改会话ID可切换到不同对话</p>
+
+            <div className="session-list-section">
+              <h4>历史会话</h4>
+              {sessions.length === 0 ? (
+                <p className="session-hint">
+                  还没有历史会话，发送第一条消息后会出现在这里。
+                </p>
+              ) : (
+                <ul className="session-list">
+                  {sessions.map((item) => (
+                    <li key={item.session_id}>
+                      <button
+                        type="button"
+                        className={
+                          'session-list-item' +
+                          (item.session_id === sessionId ? ' active' : '')
+                        }
+                        onClick={() => handleOpenSession(item.session_id)}
+                        title={item.session_id}
+                      >
+                        <span className="session-item-title">
+                          {item.title || '未命名会话'}
+                        </span>
+                        <span className="session-item-time">
+                          {formatSessionTime(item.updated_at || item.created_at)}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
               <h4>身份 ID</h4>
               <p className="session-hint">{userId}</p>
               <p className="session-hint">跨会话记忆按该身份隔离，清除浏览器数据会重新生成</p>

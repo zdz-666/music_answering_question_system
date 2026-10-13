@@ -5,7 +5,7 @@
 
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class QueryRequest(BaseModel):
@@ -37,6 +37,41 @@ class ChatHistoryResponse(BaseModel):
     timestamp: str
     # 已把较早轮次压缩成摘要，加载历史时前端可以一并展示，避免"历史忽然变短"
     summary: Optional[str] = None
+
+
+class SessionSummary(BaseModel):
+    """侧边栏一条历史会话：标题取首条用户消息，时间用于排序展示。"""
+
+    session_id: str
+    title: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class SessionListResponse(BaseModel):
+    """某用户名下的会话列表，最近活跃的在最前面。"""
+
+    sessions: List[SessionSummary]
+    total: int
+
+
+class AuthRequest(BaseModel):
+    """注册与登录共用同一份入参（形状一致，没必要拆两个模型）。
+
+    这里只做「非空 + 长度上限」这层最轻的校验：用户名的字符集、密码最短位数、
+    账号是否已存在等规则统一在 auth.py 里判断，错误信息也由那里给出，
+    避免同一套规则写两处、两边还不一致。
+    """
+
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class AuthResponse(BaseModel):
+    """登录 / 注册成功：交回该账号对应的 user_id，前端后续按它归属会话与记忆。"""
+
+    user_id: str
+    username: str
 
 
 class UploadResponse(BaseModel):

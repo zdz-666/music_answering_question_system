@@ -1,3 +1,4 @@
+import auth
 import document_loader
 import rag
 import ratelimit
@@ -11,9 +12,13 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from models import (
     QueryRequest,
+    AuthRequest,
+    AuthResponse,
     ChatMessage,
     ChatResponse,
     ChatHistoryResponse,
+    SessionListResponse,
+    SessionSummary,
     TaskStatusResponse,
     UploadResponse,
 )
@@ -32,6 +37,7 @@ from session_store import (
     get_summary,
     init_db,
     list_messages,
+    list_sessions,
 )
 
 
@@ -73,6 +79,27 @@ async def request_logging(request, call_next):
     finally:
         reset_request_id(token)
 
+# 账号体系（auth.py）：把「谁在用」从随机 user_id 变成可复用的账号。
+# 两个端点都不发 token——本次只做身份识别：登录成功后把该账号的 user_id 交给前端，
+# 后续请求照旧带 user_id（与改造前一致）。要做访问控制得再引入 token 并在每个端点上校验。
+@app.post("/api/auth/register", response_model=AuthResponse, status_code=201)
+async def register(payload: AuthRequest):
+    """注册新账号，成功返回它的 user_id；账号已存在返回 409。"""
+    try:
+        # pbkdf2 是 CPU 密集的同步计算，和 Redis 一起下沉线程池，别占住事件循环
+        return await run_in_threadpool(auth.register, payload.username, payload.password)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def login(payload: AuthRequest):
+    """用账号密码登录，成功返回该账号的 user_id；账号或密码不对一律 401。"""
+    try:
+        return await run_in_threadpool(auth.authenticate, payload.username, payload.password)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc))
+
 # 会话存储以 Redis 为准（session_store.py）：跨 worker 共享、进程重启不丢。
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: Request, query: QueryRequest):
@@ -83,7 +110,8 @@ async def chat(request: Request, query: QueryRequest):
     # Redis 不可用时 ratelimit 内部直接放行，不会因为限流组件故障拒掉正常请求。
     await ratelimit.enforce("chat", request, user_id)
 
-    session_id = get_or_create_session(query.session_id)
+    # user_id 一并传入：会话除了存消息，还会挂到该用户名下的索引，供侧边栏列历史会话
+    session_id = get_or_create_session(query.session_id, user_id)
 
     # rag.get_result 内部走 agent_loop（同步阻塞：LLM / 检索 / 网络 / Redis），
     # 直接在 async 端点里调用会占住事件循环，同一 worker 上的其它请求全部排队。
@@ -129,6 +157,22 @@ async def delete_history(session_id: str):
 
     return {"message": "对话历史已删除",
             "session_id": session_id}
+
+@app.get("/api/sessions", response_model=SessionListResponse)
+async def get_sessions(
+    user_id: str = Query(..., min_length=1, description="用户身份，会话按它隔离"),
+    number: int = Query(20, ge=1, le=100),
+):
+    """列出该用户名下的历史会话（最近活跃在前），供前端侧边栏渲染。
+
+    会话数据在 Redis 里，读一批 meta 是阻塞 IO，与其它端点一致下沉线程池。
+    user_id 是必填：没有身份就没有「我的会话」这个概念。
+    """
+    sessions = await run_in_threadpool(list_sessions, user_id, number)
+    return SessionListResponse(
+        sessions=[SessionSummary(**item) for item in sessions],
+        total=len(sessions),
+    )
 
 @app.post("/api/upload", response_model=UploadResponse, status_code=202)
 async def upload_file(
