@@ -115,6 +115,8 @@ AGENT_HISTORY_LIMIT = int(os.getenv("AGENT_HISTORY_LIMIT", "200"))
 # 返回边界上的答案验收（agent._judge_answer）：连续判定「未完成」的拦截上限，
 # 超过就带着当前答案收尾；评估器自身报错时也是直接收尾（fail-open），不空转。
 ANSWER_BLOCK_CAP = int(os.getenv("ANSWER_BLOCK_CAP", "3"))
+# 子智能体（父智能体的 task 工具）自己那条 agent loop 的轮数上限
+SUBAGENT_MAX_ROUNDS = int(os.getenv("SUBAGENT_MAX_ROUNDS", "10"))
 
 # ---- Redis（会话 / 缓存 / 限流 / 任务队列）----
 # 定位分两档，别混为一谈：

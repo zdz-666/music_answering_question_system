@@ -12,14 +12,15 @@
 ## 功能特性
 
 - **agent_loop 工具调用**：一轮问答由模型自主决定「直接作答 / 调 `knowledge_base_search`（本地知识库）/ 调 `web_search`（联网搜索）/ 调 `read_file`（读记忆文件或压缩归档）/ 主动 `compact`（压缩历史）」。多个工具结果以 OpenAI 工具消息格式接回上下文，最多循环 `MAX_TOOL_ROUNDS`（8）轮，避免工具停不下来。**停止条件不看「还有没有工具调用」**：模型不再调工具只代表它想停，此时会在返回边界过一道独立验收（`_judge_answer`，不挂工具、只读对话），判定「回答是否已充分回应用户问题」；不通过就把缺口作为 user 消息回灌、继续跑（最多 `ANSWER_BLOCK_CAP` 次），验收器故障或拦截到上限则带着当前答案收尾。「走知识库还是走网络」不再由单独的通道规划模型预先决定，而是模型在 loop 里按需选择。
+- **子智能体（task 工具）**：父智能体可以把一段自包含的子任务外包出去——`_run_subagent` 会起一条**独立的 agent loop**，有自己的 `messages` 队列和自己的 `ContextCompactor`，而工具里没有 `task`（不能再往下委派，避免无限套娃）。父对话的历史与记忆不带进去，中间的工具往返也只留在子智能体那侧，**回到父对话的只有最终结论**，因此父上下文不会被子任务的检索过程撑大。轮数上限 `SUBAGENT_MAX_ROUNDS`（默认 10），耗尽仍未得出结论时如实回一句说明，交给父智能体处置。
 - **查询重写**：工具内部把口语化的用户提问改写为适合向量检索的正式查询；联网搜索前再单独做一次关键词净化。
 - **智能路由（Collection Router）**：由 LLM 判断问题应该落到哪个集合，支持多集合同时命中。
 - **混合检索 + 重排序**：Chroma 稠密检索与 BM25 稀疏检索按 0.6/0.4 加权融合，再用 Reranker 模型按相关性截取前 50%；重排服务不可用时退化为检索原序。
 - **文件式长期记忆**：按 `user_id` 分目录（`.memory/<user>-<hash>/`），每条记忆是一个带 YAML frontmatter（name / description / type）的 Markdown 文件，目录另有 `MEMORY.md` 索引。回答前用 LLM 从索引里召回相关记忆、按需读回正文，注入 **system prompt**；一轮结束后抽取新的持久记忆，条数超过阈值时再合并去重。
 - **分级上下文压缩**：每次调模型前对聊天消息跑一遍 `ContextCompactor`——超大工具结果落盘 → 中段消息归档成 transcript → 微压缩/缩短工具结果 → 仍超限则整段汇总成一条摘要消息；压缩得到的摘要会写回 Redis 会话，下一轮上下文更小。
 - **多轮会话（Redis）**：会话以 Redis 为准（多 worker 共享、进程重启不丢）；消息追加与压缩提交走 Lua 保证原子。
-- **检索补充（Retrieval Reflection）**：检索完成后由 LLM 判断信息是否足够，不够就用新语句再检索一轮，最多补充 2 轮。这条链路服务于 `get_result_evaluate` 离线评测；在线 agent 问答里是否补检索由模型自行决定。
-- **自反思过滤（Self-Reflection）**：生成答案前由 LLM 从知识库/网络结果中剔除无关信息。同样用于评测链路。
+- **检索补充（Retrieval Reflection）**：检索完成后由 LLM 判断信息是否足够，不够就用新语句再检索一轮，最多补充 2 轮。这条链路服务于 `rag_pipeline.get_result_evaluate` 离线评测；在线 agent 问答里是否补检索由模型自行决定。
+- **自反思过滤（Self-Reflection）**：生成答案前由 LLM 从知识库/网络结果中剔除无关信息。同样只服务于 `rag_pipeline.py` 里的评测链路。
 - **文件问答**：上传 `.pdf` / `.docx`，或直接上传一张图片（`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`）
   单独提问。文档会同时解析正文与内嵌图片——图片由视觉模型（VLM）
   转成中文描述后一起参与问答，扫描页（无文字层）自动整页渲染识别。
@@ -65,15 +66,16 @@
 ```
 bishe/
 ├── main.py                 # FastAPI 入口，路由、文件上传（会话已外置到 session_store.py）
-├── agent.py                # agent_loop 主循环：工具定义与执行、记忆注入、压缩写回、记忆学习
-├── rag.py                  # 检索原语（重写/路由/混合检索/重排/联网/自反思）+ 格式化函数 + 评测链路
+├── agent.py                # agent_loop 主循环：工具定义与执行（含子智能体 task）、记忆注入、压缩写回、记忆学习
+├── rag.py                  # 在线链路用的检索原语（重写/路由/混合检索/重排/联网）+ 格式化函数 + 问答入口
+├── rag_pipeline.py         # 改造前的旧 RAG 管道（通道规划 → 检索 → 补充检索 → 自反思 → 生成），只服务离线评测
 ├── context_compact.py      # 上下文分级压缩（ContextCompactor：落盘 / 归档 / 微压缩 / 汇总）
 ├── file_access.py          # read_file 工具的白名单读取（记忆目录 + 压缩归档，按 user_id 隔离，防路径穿越）
 ├── worker.py               # 上传任务消费者：独立进程从队列取任务，跑「解析 → agent 问答 → 落库」
 ├── tasks.py                # 任务队列原语：入队/取任务/状态读写、暂存文件、结果与 TTL
 ├── ratelimit.py            # 接口限流：Lua 令牌桶、按 user_id/IP 计数、Redis 不可用时放行
 ├── collection_router.py    # LLM 结构化输出做集合路由（含独立测试入口）
-├── retrieval_planner.py    # LLM 结构化输出做检索决策：通道规划 + 信息是否充分（评测链路）
+├── retrieval_planner.py    # LLM 结构化输出做检索决策：通道规划 + 信息是否充分（仅 rag_pipeline 离线评测使用）
 ├── document_loader.py      # 上传解析：PDF/DOCX 正文与内嵌图、独立图片、VLM 图片描述、描述缓存
 ├── data_storage.py         # Chroma 集合创建/删除、稠密+BM25 混合检索
 ├── dynamic_chunk.py        # 基于句子语义相似度的动态分块（SemanticChunker）
@@ -131,6 +133,8 @@ agent.run（agent.py）
          │       │     │        └─ Chroma 稠密 + BM25 稀疏混合检索 (k=6) → Reranker 取前 50%
          │       │     ├─ web_search            → 关键词净化 → Tavily（5 条）
          │       │     ├─ read_file             → 白名单校验 → 读记忆文件 / 压缩归档
+         │       │     ├─ task                  → _run_subagent：另一条独立 agent loop（自己的 messages + 压缩器）
+         │       │     │        └─ 回到父对话的只有最终结论；子智能体工具里没有 task，不能再往下委派
          │       │     └─ compact               → 本轮工具执行后 compact_history
          │       │        结果作为 role="tool" 消息接回 → 继续 loop
          │       │
@@ -395,6 +399,7 @@ cp .env.example .env    # 然后填写 .env
 `SUMMARY_INPUT_CHAR_LIMIT` / `KEEP_RECENT_RESULTS` / `KEEP_RECENT_MESSAGES` /
 `CONVERSATION_SNIP_LIMIT` / `TRANSCRIPT_DIR` / `TOOL_RESULTS_DIR` / `AGENT_HISTORY_LIMIT`（上下文压缩阈值与落盘目录）、
 `ANSWER_BLOCK_CAP`（返回边界答案验收连续拦截的上限，默认 3）、
+`SUBAGENT_MAX_ROUNDS`（子智能体那条 agent loop 的轮数上限，默认 10）、
 `RATE_LIMIT_ENABLED`（限流总开关，置 false 关闭）、`RATE_LIMIT_CHAT_*` / `RATE_LIMIT_UPLOAD_*`
 （两类接口令牌桶的容量与每秒补充速率）、
 `TASK_TTL_SECONDS`（上传任务记录存活秒数，默认 7200）、`UPLOAD_SPOOL_DIR`（上传任务排队期间的暂存目录）、
@@ -505,7 +510,7 @@ npm start
 
 评测口径与 RGB 官方一致：每条样本把自带的 `positive` + `negative` 合并成一篇文本，
 按固定长度切分（`--chunker fixed`，`chunk_size=300`）切成检索单元当知识库，
-只把 `query` 交给 `rag.get_result_evaluate()`——通道规划、集合路由、网络搜索被关闭，
+只把 `query` 交给 `rag_pipeline.get_result_evaluate()`——通道规划、集合路由、网络搜索被关闭，
 「查询重写 → 混合检索 → 重排 → 补充检索 → 自反思 → 生成」这条链路与线上完全一致。
 判定用官方 `checkanswer`：参考答案的每一条都要作为子串出现在生成答案中才算命中。
 
@@ -586,6 +591,8 @@ python llm_ev.py
 | `agent.reactive_compact` | 模型报「上下文过长」，即将反应式压缩后重试 | `step` |
 | `agent.answer_check` | 返回边界的答案验收（独立、不挂工具的模型） | `is_complete`、`missing` |
 | `agent.answer_check_failed` / `agent.answer_check_limit` / `agent.force_final` / `agent.force_final_failed` | 验收器故障（fail-open 收尾）/ 连续拦截达上限 / 轮数耗尽后的兜底收尾 | `error`、`blocks`、`cap` |
+| `agent.subagent` / `agent.subagent_tool` | 子智能体的整段执行 / 它在自己那条 loop 里发起的每次工具调用 | `prompt`、`tool` |
+| `agent.subagent_limit` | 子智能体轮数耗尽仍未得出结论 | `rounds` |
 | `agent.tool_failed` / `agent.memory_failed` / `agent.learn_failed` / `agent.save_compaction_failed` | agent 内的工具 / 记忆 / 压缩写回降级点，不打断回答 | `tool`、`error` |
 | `memory.learn` / `memory.recall_select` / `memory.extract` / `memory.consolidate` | 文件式记忆的抽取、召回选择与合并（`memory.learn` 是设置 span 的步骤） | `user_id`、`records`、`output` |
 | `memory.index_failed` / `memory.recall_failed` / `memory.recall_select_failed` / `memory.extract_failed` / `memory.consolidate_failed` / `memory.consolidate_skipped` | 记忆各步失败或跳过，已降级为「无记忆 / 不更新」 | `user_id`、`error`、`chars` |
@@ -605,11 +612,11 @@ python llm_ev.py
 | `worker.start` / `worker.no_redis` | worker 启动参数 / 拿不到 Redis 连接（此时上传走同步，队列用不上） | `once`、`detail` |
 
 **已埋点的步骤**：`request`（请求级）→ `rag.total`（RAG 链路汇总）→ `agent.run`（agent_loop 汇总）
-→ `agent.tool`（每次工具调用）、`agent.answer_check`（返回边界答案验收）、`collection_router`、`query_rewriting`、`vector_search`、`rerank`、
+→ `agent.tool`（每次工具调用）、`agent.answer_check`（返回边界答案验收）、`agent.subagent`（子智能体）与 `agent.subagent_tool`（它内部的工具调用）、`collection_router`、`query_rewriting`、`vector_search`、`rerank`、
 `web_search`、`web_rewriting`、`memory.recall_select`、`memory.extract`、`memory.consolidate`、
 `context.summarize`。
 
-评测链路（`get_result_evaluate`）不走 agent，仍会埋 `retrieval_planner`、`retrieval_sufficiency`、
+评测链路（`rag_pipeline.get_result_evaluate`）不走 agent，仍会埋 `retrieval_planner`、`retrieval_sufficiency`、
 `self_reflection`、`generate` 等步骤——这些在线问答里已被 agent 的工具循环取代。
 
 其中 `query_rewriting` / `collection_router` / `vector_search` 会多带一个 `cached` 字段
@@ -685,7 +692,7 @@ request  31207.4ms  3028/2030 tok  $0.000000  4 llm  path=/api/chat  method=POST
 > 同一段日志里其它请求的行会被自动忽略。`agent.run` 内每次 `invoke` 的 token 会累加，
 > 因此 `rag.total` 一行就是整条链路的合计。
 
-评测链路（`get_result_evaluate`，仍走固定的「通道规划 → 检索 → 补充检索 → 自反思」）里，
+评测链路（`rag_pipeline.get_result_evaluate`，仍走固定的「通道规划 → 检索 → 补充检索 → 自反思」）里，
 `retrieval_sufficiency` 判定「不够」时会给出新语句，后面紧跟着第二轮检索，最后再审查一次
 （同一棵树里只截取与补充检索相关的节点，`vector_search` / `rerank` 等首轮节点未展开）：
 

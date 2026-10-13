@@ -18,11 +18,17 @@
 或连续拦截达 ANSWER_BLOCK_CAP 时带着当前答案收尾；轮数耗尽仍没拿到正文则补一次
 不带工具的收尾，避免把空字符串当答案返回。
 
-工具四个：
+工具里的 task 会把一段自包含的子任务外包给子智能体（_run_subagent）：子智能体是另一条
+独立的 agent loop，有自己的 messages 和自己的压缩器（参考 subagent_example.py），
+工具里没有 task 所以不能再往下委派，回到父对话的只有它的最终结论——父上下文不会被子任务的
+检索过程撑大。
+
+工具五个：
 - knowledge_base_search：复用 rag 的集合路由 + 混合检索 + 重排 + 自反思前的原始 chunk；
 - web_search：复用 rag 的联网搜索；
 - read_file：读该用户的记忆文件，或读回上下文压缩落盘/归档的原始内容；
-- compact：模型自己要一次上下文压缩。
+- compact：模型自己要一次上下文压缩；
+- task：把子任务交给子智能体执行，只拿回结论（子智能体看不到父对话与记忆）。
 
 消息全程用 OpenAI 格式的 dict（assistant.tool_calls / role="tool"），这样既能直接交给
 LangChain 的 ChatOpenAI.invoke，又能让 ContextCompactor 像示例那样按统一结构处理。
@@ -41,6 +47,7 @@ from pydantic import BaseModel, Field
 from config import (
     ANSWER_BLOCK_CAP,
     CACHE_TTL_ANSWER,
+    SUBAGENT_MAX_ROUNDS,
     SUMMARY_INPUT_CHAR_LIMIT,
     get_chat_model,
 )
@@ -61,6 +68,7 @@ SYSTEM = """你是一个专业的音乐知识问答助手，名为“乐典”�
 - web_search：联网搜索最新信息。当问题涉及时效性内容、新闻、最新动态时使用。
 - read_file：读取记忆文件或上下文压缩归档的内容。当系统提示里的记忆索引不够、需要看某条记忆的正文，或需要回读被压缩替换掉的结果时使用。
 - compact：当对话已经很长、上下文快放不下时，可以主动请求压缩历史。
+- task：把一个独立的子任务交给子智能体单独执行，只拿回它的最终结论。适合「要多轮检索或搜索才能收敛、又不希望中间过程占满当前对话」的子问题；prompt 必须自包含，写清目标、范围与需要的产出形式——子智能体看不到当前对话与记忆，别假设它已经知道什么。
 选择工具时给出简洁、精准的检索语句；不需要外部信息时直接凭自身知识作答，不要为了调用而调用。
 
 组织与输出（必须严格遵守，前端会按 Markdown 渲染）：
@@ -71,6 +79,20 @@ SYSTEM = """你是一个专业的音乐知识问答助手，名为“乐典”�
 - 需要横向对比多项内容时，使用 Markdown 表格呈现。
 - 引用原文或他人观点时使用 > 引用块。
 - 直接输出 Markdown 正文本身，严禁把整个回答包裹在 ``` 代码块中。"""
+
+# 子智能体的 system：只交代身份、工具与交付要求，不带父对话的历史与记忆
+SUBAGENT_SYSTEM = """你是“乐典”音乐助手的子智能体，负责独立完成父助手交给你的一项子任务。
+
+你可以调用工具获取外部信息：
+- knowledge_base_search：检索本地知识库（音乐理解、歌单、自我介绍等）。
+- web_search：联网搜索最新或时效性强的信息。
+- read_file：读取本用户的记忆文件或上下文压缩归档的内容。
+- compact：对话很长、上下文快放不下时，请求压缩历史以腾出空间。
+
+要求：
+- 任务描述里没给的信息不要臆造；需要依据就先检索，检索不到就如实说明。
+- 完成后只汇报结果本身（结论 + 关键依据），不要复述过程、不要反问、不要寒暄。
+- 结论用简洁的 Markdown 组织，直接输出正文，严禁用 ``` 包裹整个回答。"""
 
 
 def _tools() -> list[dict]:
@@ -132,10 +154,34 @@ def _tools() -> list[dict]:
                 "parameters": {"type": "object", "properties": {}},
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": (
+                    "把一个独立的子任务交给子智能体执行，只拿回它的最终结论。"
+                    "子智能体有自己的对话队列、看不到当前上下文，因此 prompt 必须自包含；"
+                    "适合需要多轮检索/搜索才能收敛、且中间过程不必留在当前对话的子问题。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "自包含的子任务描述：要完成什么、边界在哪、需要什么形式的结论",
+                        }
+                    },
+                    "required": ["prompt"],
+                },
+            },
+        },
     ]
 
 
 TOOLS = _tools()
+
+# 子智能体拿到的工具：与父智能体一致，但不含 task —— 因此它不能再往下委派，不会无限套娃
+SUBAGENT_TOOLS = [tool for tool in TOOLS if tool["function"]["name"] != "task"]
 
 
 def _knowledge_base_search(query: str) -> str:
@@ -164,6 +210,8 @@ def _execute_tool(name: str, args: dict, user_id: str) -> str:
             return _web_search(str(args.get("query", "")).strip())
         if name == "read_file":
             return file_access.read_file(str(args.get("path", "")).strip(), user_id)
+        if name == "task":
+            return _run_subagent(str(args.get("prompt", "")).strip(), user_id)
     except Exception as exc:  # noqa: BLE001 - 工具失败要让模型知道，而不是整轮报错
         logger.warning(
             "agent.tool_failed",
@@ -171,6 +219,71 @@ def _execute_tool(name: str, args: dict, user_id: str) -> str:
         )
         return f"工具 {name} 执行失败：{type(exc).__name__}: {exc}"
     return f"未知工具：{name}"
+
+
+def _run_subagent(prompt: str, user_id: str) -> str:
+    """跑一个子智能体：自己的 messages、自己的压缩器，只把最终结论交回父对话。
+
+    参考 subagent_example.py 的 task 工具——子智能体是「另一条 agent loop」：
+    工具实现共用（_execute_tool），但消息队列完全独立。父对话的历史与记忆不带进去，
+    它中间的工具往返也只留在自己这边，回到父对话的只有最后一段文本，
+    因此父上下文不会被子任务的检索过程撑大。
+
+    SUBAGENT_TOOLS 里没有 task，所以它不能再往下委派（与示例一致，避免无限套娃）。
+    """
+    if not prompt:
+        return "子任务描述为空，未执行。"
+
+    compactor = ContextCompactor(user_id)
+    llm = get_chat_model().bind_tools(SUBAGENT_TOOLS)
+    messages: list[dict] = [{"role": "user", "content": prompt}]
+
+    with log_step("agent.subagent", prompt=prompt) as span:
+        for _ in range(SUBAGENT_MAX_ROUNDS):
+            messages = compactor.prepare(messages, prompt)
+            response = llm.invoke(
+                [{"role": "system", "content": SUBAGENT_SYSTEM}, *messages]
+            )
+            messages.append(_assistant_message(response))
+
+            if not response.tool_calls:
+                result = (response.content or "").strip() or "（子智能体没有给出结论）"
+                break
+
+            compact_requested = False
+            for call in response.tool_calls:
+                if call["name"] == "compact":
+                    output = "已请求在本批工具之后压缩上下文。"
+                    compact_requested = True
+                else:
+                    with log_step(
+                        "agent.subagent_tool", tool=call["name"]
+                    ) as tool_span:
+                        output = _execute_tool(
+                            call["name"], call.get("args") or {}, user_id
+                        )
+                        tool_span.output = output
+                messages.append(
+                    {"role": "tool", "tool_call_id": call["id"], "content": output}
+                )
+
+            if compact_requested:
+                messages[:] = compactor.compact_history(messages, prompt)
+        else:
+            # 轮数耗尽仍没结论：如实告诉父智能体，别让它以为子任务办成了
+            logger.warning(
+                "agent.subagent_limit",
+                extra={"fields": {"rounds": SUBAGENT_MAX_ROUNDS}},
+            )
+            result = (
+                f"子智能体在 {SUBAGENT_MAX_ROUNDS} 轮内未得出结论，"
+                "请缩小任务范围，或由你直接完成。"
+            )
+
+        # 子智能体的压缩结果不外传：只把结论给父对话，中间过程留在它自己的队列里
+        span.output = result
+
+    return result
 
 
 def _assistant_message(response: AIMessage) -> dict:

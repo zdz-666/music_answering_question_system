@@ -6,7 +6,7 @@
 - plan_retrieval_channels：这次提问该走知识库、走网络、还是都走（或都不走）。
   取代原先由前端两个勾选框硬控 `use_web_search` / `use_knowledge_base` 的做法。
 - judge_retrieval_sufficiency：已检索到的信息够不够；不够时给出新的检索语句，
-  供 rag.py 里的补充检索循环再用一轮。
+  供 rag_pipeline.py 里的补充检索循环再用一轮。
 """
 
 from langchain_core.prompts import ChatPromptTemplate

@@ -1,5 +1,5 @@
 from langchain_core.prompts import ChatPromptTemplate
-import rag
+from rag_pipeline import get_result_evaluate
 import json
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 import jieba
@@ -78,7 +78,7 @@ def llm_evaluator(query: str, reference_text: str, generated_answer: str):
     return response.content
 
 def rag_process(query: str):
-    context, result_content = rag.get_result_evaluate(query=query)
+    context, result_content = get_result_evaluate(query=query)
     result = llm_evaluator(
         query=query,
         reference_text=context,

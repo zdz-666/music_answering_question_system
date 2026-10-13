@@ -4,7 +4,7 @@
 `id / query / answer / positive / negative`。
 
 评测时先把样本自带的 positive + negative 合并成一篇文本，再用切块器切成块，
-把这些块当作知识库内容传给 rag.get_result_evaluate(query, external_docs=...)：
+把这些块当作知识库内容传给 rag_pipeline.get_result_evaluate(query, external_docs=...)：
 通道规划、集合路由、网络搜索被跳过，查询重写 → 混合检索 → 重排 → 补充检索 →
 自反思 → 生成这整条链路保持与线上一致。
 
@@ -13,7 +13,7 @@
 - fixed：fixed_chunk.FixedChunker，按固定长度等步长滑动窗口切，可设重叠。
 
 评测方法：
-- 逐条调 rag.get_result_evaluate(query, external_docs=...)，拿回 (检索到的上下文, 生成答案)；
+- 逐条调 rag_pipeline.get_result_evaluate(query, external_docs=...)，拿回 (检索到的上下文, 生成答案)；
 - 用 RGB 官方 checkanswer 做子串匹配：参考答案里的每一条都出现在生成答案中才算命中；
 - 汇总准确率（对齐 RGB 的 all_rate）与拒答率，逐条明细落 JSONL，支持断点续跑。
 
@@ -37,7 +37,7 @@ import urllib.request
 
 from tqdm import tqdm
 
-import rag
+from rag_pipeline import get_result_evaluate
 from dynamic_chunk import SemanticChunker
 from fixed_chunk import FixedChunker
 from observability import (
@@ -174,7 +174,7 @@ def evaluate_one(instance: dict, chunker: SemanticChunker | FixedChunker) -> dic
     try:
         # 切块本身要调嵌入接口，可能被网络抖动打挂，放进 try 才不会让整轮白跑
         corpus = build_corpus(instance, chunker)
-        context, prediction = rag.get_result_evaluate(query, external_docs=corpus)
+        context, prediction = get_result_evaluate(query, external_docs=corpus)
     except Exception as exc:  # 单条异常（上游抖动等）不该让整轮白跑
         logger.error(
             "rgb_eval.query_failed",
