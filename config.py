@@ -138,7 +138,7 @@ REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "musicrag:v1")
 # 即「最后一次活动之后 30 天过期」；过期的会话查历史会得到 404。
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "2592000"))
 # 各层缓存的存活时间（秒）。越靠前的层输入越稳定、越靠后的层越容易过期：
-# 嵌入只由文本决定，给一天；查询重写/集合路由是 LLM 的确定性映射，给一小时；
+# 嵌入只由文本决定，给一天；集合路由是 LLM 的确定性映射，给一小时；
 # 检索结果绑定集合内容，给一小时；最终答案受联网结果影响，只给几分钟。
 CACHE_TTL_EMBEDDING = int(os.getenv("CACHE_TTL_EMBEDDING", "86400"))
 CACHE_TTL_LLM = int(os.getenv("CACHE_TTL_LLM", "3600"))

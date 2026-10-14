@@ -6,7 +6,7 @@
 
 分层原则（越靠前的层输入越稳定，可以缓存得越久）：
 - 嵌入向量：embed_query 是纯函数，同样的文本必然得到同样的向量 → CACHE_TTL_EMBEDDING
-- 查询重写 / 集合路由：LLM 对单条输入的确定性映射 → CACHE_TTL_LLM
+- 集合路由：LLM 对单条输入的确定性映射 → CACHE_TTL_LLM
 - 检索结果：只依赖「集合内容 + 改写后的查询」 → CACHE_TTL_RETRIEVAL
 - 最终答案：还受历史、长期记忆、联网结果影响，只有这些全为空时才可缓存 → CACHE_TTL_ANSWER
 

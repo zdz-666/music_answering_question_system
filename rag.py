@@ -1,4 +1,3 @@
-from langchain_core.prompts import ChatPromptTemplate
 import agent
 import cache
 import document_loader
@@ -21,7 +20,6 @@ from config import (
     TAVILY_API_URL,
     TAVILY_MAX_RESULTS,
     WEB_SEARCH_TIMEOUT,
-    get_chat_model,
     get_rerank_api_key,
     get_tavily_api_key,
 )
@@ -88,89 +86,6 @@ def _post_json(
         return response.json()
     except ValueError as exc:
         raise _RetryableServiceError(f"响应不是合法 JSON: {response.text[:200]}") from exc
-
-
-def query_rewriting(query: str):
-    llm = get_chat_model()
-    prompt = """
-你是一个专业的查询优化助手。你的任务是将用户输入的自然语言查询重写为更适合向量数据库检索的形式。
-
-用户输入：{question}
-
-重写规则：
-1. 移除无关的礼貌用语、问候语和冗余词语
-2. 保留核心意图和关键实体
-3. 将口语化表达转换为正式的检索查询
-4. 消除歧义，明确查询意图
-5. 扩展相关同义词（可选，当有助于检索时）
-6. 保持查询简洁，通常在5-15个词之间
-
-示例：
-输入："嘿，我想了解一下最近人工智能在医疗领域有哪些新进展，谢谢！"
-输出："人工智能在医疗健康领域的最新研究进展和应用"
-
-输入："那个，我不太确定怎么表达，就是机器学习模型训练的时候怎么防止过拟合啊？"
-输出："机器学习模型防止过拟合的方法和技术"
-
-注意：不要添加任何额外的解释，直接输出优化后的查询。
-"""
-    rewriting_query = ChatPromptTemplate.from_template(prompt)
-    messages = rewriting_query.format_messages(question=query)
-
-    # 重写结果只由这条 query 决定，与历史、记忆无关，因此按 query 缓存是安全的；
-    # 一次请求里多集合轮询与补充检索会反复走到这里，命中率很高。
-    name = cache.key("rewrite", cache.digest(query))
-    cached = cache.get_json(name)
-    with log_step(
-        "query_rewriting", input=query, query_len=len(query), cached=cached is not None
-    ) as span:
-        if cached is None:
-            cached = llm.invoke(messages).content
-            cache.set_json(name, cached, CACHE_TTL_LLM)
-        span.output = cached
-    return cached
-
-
-def web_rewriting(query: str):
-    llm = get_chat_model()
-    prompt = """
-你是一个专业的“搜索查询净化与关键词提取”助手。你的任务是将用户凌乱、口语化、包含无关信息的原始查询，转化为简洁、精准、适合直接用于搜索引擎（如Google、Bing、百度）的关键词或短语。
-
-处理规则：
-*   **去除噪声**：剔除所有感叹词、语气词、与核心意图无关的冗余描述、人称代词（如“我”、“我的”）、以及“请问”、“有没有人知道”、“谢谢”等社交性用语。
-*   **保留核心**：识别并保留查询中的核心实体（如人名、地名、产品名、事件）、核心动作/需求、以及关键的时空、属性限定词。
-*   **结构化输出**：将提取出的关键词，以最相关、最必要的顺序，组合成**一个**简洁的搜索短语。通常采用“核心问题/对象 + 关键限定”的结构。避免输出多个不连贯的单词。
-*   **同义合并**：如果用户用不同词语表达了相同意思，合并为最标准、最常用的那个词。
-*   **隐含需求显性化**：如果用户的问题隐含了一个更通用的搜索意图，可以适度扩展。例如，“怎么让我的苹果手机不卡” 可以提取为 “iPhone 运行卡顿 解决方法”。
-*   **绝对禁止**：不要添加任何解释性文字，只输出净化后的搜索短语本身。
-
-**输入/输出格式:**
-- 输入: [用户原始查询]
-- 输出: [净化后的搜索关键词/短语]
-
-**上下文示例 :**
-- 输入: “哎呀，我昨天看的那部科幻电影，叫什么来着，就是有外星飞船和时空穿越的，特效特别牛，好像是2018年左右的？”
-- 输出: “2018年 外星飞船 时空穿越 科幻电影 推荐”
-
-- 输入: “大神求助！我的Win10电脑开机特别慢，要等好几分钟，怎么解决啊？急急急！”
-- 输出: “Win10 开机速度慢 优化 解决方法”
-
-- 输入: “谁能告诉我，去日本东京旅游，除了东京塔和迪士尼，还有哪些值得去的、不那么游客扎堆的地方？”
-- 输出: “东京 小众 旅游景点 推荐 非热门”
-
-- 输入: “最近想买蓝牙耳机，主要用来通勤听播客，希望降噪好、续航长，预算1000左右，求推荐！”
-- 输出: “蓝牙耳机 推荐 降噪 长续航 播客 1000元预算”
-
-**现在，请处理以下用户查询：**
-输入: {question}
-输出:
-"""
-    rewriting_query = ChatPromptTemplate.from_template(prompt)
-    messages = rewriting_query.format_messages(question=query)
-    with log_step("web_rewriting", input=query, query_len=len(query)) as span:
-        result = llm.invoke(messages)
-        span.output = result.content
-    return result.content
 
 
 def web_search(query: str) -> list:

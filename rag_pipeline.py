@@ -129,7 +129,7 @@ def _supplement_retrieval(
 def _retrieve_and_reflect(question: str, external_docs: list | None = None) -> str:
     """通道规划 → 首轮检索 → 补充检索 → 自反思，返回可直接作为 {context} 的字符串。
 
-    通道规划必须放在最前面：它决定 collection_router / web_rewriting 要不要跑，
+    通道规划必须放在最前面：它决定 collection_router 与联网检索要不要跑，
     放晚了关掉的通道会被白跑一遍。
 
     external_docs 非 None 时进入评测模式：跳过通道规划、集合路由与联网搜索，

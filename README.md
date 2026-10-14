@@ -265,13 +265,13 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 ### 缓存（Redis）
 
 缓存按「输入是否唯一决定输出」从低风险到高风险分四层，统一收口在 [cache.py](file:///d:/bishe/cache.py)
-（键前缀、序列化、降级、失效都在这一个文件里）。命中情况直接进链路日志：`query_rewriting` /
-`collection_router` / `vector_search` 三个 span 都多了一个 `cached` 字段。
+（键前缀、序列化、降级、失效都在这一个文件里）。命中情况直接进链路日志：`collection_router` /
+`vector_search` 两个 span 都多带一个 `cached` 字段。
 
 | 层 | 缓存对象 | 键的组成 | TTL | 失效方式 |
 | --- | --- | --- | --- | --- |
 | ① | `embed_query` 算出的向量 | 文本摘要 | 1 天 | 只由文本决定，无需失效 |
-| ② | 查询重写 / 集合路由结果 | 输入文本摘要 | 1 小时 | TTL |
+| ② | 集合路由结果 | 输入文本摘要 | 1 小时 | TTL |
 | ③ | 单集合的「混合检索 + 重排」结果 | 集合名 + 集合版本 + 改写后的查询 + k | 1 小时 | 知识库写入时集合版本 +1，旧键立刻失联 |
 | ④ | 最终答案 | 问题摘要 | 5 分钟 | TTL |
 
@@ -621,20 +621,20 @@ python llm_ev.py
 | `worker.start` / `worker.no_redis` | worker 启动参数 / 拿不到 Redis 连接（此时上传走同步，队列用不上） | `once`、`detail` |
 
 **已埋点的步骤**：`request`（请求级）→ `rag.total`（RAG 链路汇总）→ `agent.run`（agent_loop 汇总）
-→ `agent.tool`（每次工具调用）、`agent.answer_check`（返回边界答案验收）、`agent.subagent`（子智能体）与 `agent.subagent_tool`（它内部的工具调用）、`collection_router`、`query_rewriting`、`vector_search`、`rerank`、
-`web_search`、`web_rewriting`、`memory.recall_select`、`memory.extract`、`memory.consolidate`、
+→ `agent.tool`（每次工具调用）、`agent.answer_check`（返回边界答案验收）、`agent.subagent`（子智能体）与 `agent.subagent_tool`（它内部的工具调用）、`collection_router`、`vector_search`、`rerank`、
+`web_search`、`memory.recall_select`、`memory.extract`、`memory.consolidate`、
 `context.summarize`。
 
 评测链路（`rag_pipeline.get_result_evaluate`）不走 agent，仍会埋 `retrieval_planner`、`retrieval_sufficiency`、
 `self_reflection`、`generate` 等步骤——这些在线问答里已被 agent 的工具循环取代。
 
-其中 `query_rewriting` / `collection_router` / `vector_search` 会多带一个 `cached` 字段
+其中 `collection_router` / `vector_search` 会多带一个 `cached` 字段
 （`true` 表示这一步直接读了 Redis，耗时接近于 0），离线看链路时一眼能分辨
 「这次快是因为缓存」还是「真的算得快」。
 
-补充检索会让同一 `request_id` 下出现多个同名的 `vector_search` / `web_search` / `query_rewriting` span，
+补充检索会让同一 `request_id` 下出现多个同名的 `vector_search` / `web_search` span，
 用 `span_id` 区分轮次（与「多个集合各检索一次」是同一套机制）。评测链路里通道被判定为不需要时，
-对应的 `collection_router` / `web_rewriting` 等 span 会**整条不出现**；在线问答则由 `agent.tool`
+对应的 `collection_router` 等 span 会**整条不出现**；在线问答则由 `agent.tool`
 是否出现来判断这一轮模型究竟调了哪些工具。
 
 上传任务由 worker 进程执行，除了上面这些步骤还会多一个 `task.upload` span 作为根节点
