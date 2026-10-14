@@ -406,7 +406,6 @@ def answer_with_file(
     filename: str,
     content: bytes,
     question: str | None,
-    session_id: str | None,
     user_id: str,
 ) -> dict:
     """上传文件的完整问答流程：解析 → agent 问答 → 落会话。
@@ -431,8 +430,8 @@ def answer_with_file(
             "chars": len(file_content),
         }
 
-    # user_id 一并传入：上传走到的会话也要挂到该用户名下的索引，侧边栏才列得出来
-    session_id = get_or_create_session(session_id, (user_id or "").strip())
+    # 上传走到的会话与文本问答是同一个：id 由 user_id 派生，一个账号只有一个会话。
+    session_id = get_or_create_session((user_id or "").strip())
     answer = agent.run(
         question or "请分析上传的文件",
         session_id=session_id,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { chatAPI } from './service/api.js';
@@ -124,24 +124,9 @@ function LoginPage({ onAuthenticated }) {
   );
 }
 
-// 会话列表里每条记录的时间显示（后端给的是 ISO 字符串，解析失败就留空）
-function formatSessionTime(value) {
-  if (!value) return '';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleString([], {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
 function App() {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
-  const [sessionId, setSessionId] = useState('');
-  const [sessions, setSessions] = useState([]);
   // 登录态：必须有 user_id 和账号名才算登录（两个一起写、一起清）。
   // 只认到旧版的匿名 user_id（改造前随机生成、没有账号名）也当作未登录，重新登录一次，
   // 否则旧身份会绕过登录页，用户会以为登录界面没生效。
@@ -150,6 +135,8 @@ function App() {
   const username = identity.username;
   const loggedIn = Boolean(userId && username);
   const [loading, setLoading] = useState(false);
+  // 历史加载中：避免历史还没到时先闪一下「欢迎/空状态」，让人误以为没有历史记录
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadStage, setUploadStage] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
@@ -157,7 +144,7 @@ function App() {
   const [selfIntroduction, setSelfIntroduction] = useState('');
   const [musicAnalysis, setMusicAnalysis] = useState('');
   const [musicList, setMusicList] = useState('');
-  const [showKnowledge, setShowKnowledge] = useState(false);
+  const [showKnowledge, setShowKnowledge] = useState(true);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const inputRef = useRef(null);
@@ -171,26 +158,41 @@ function App() {
     scrollToBottom();
   }, [messages]);
 
-  // 会话列表：侧边栏导航用。拉取失败就退化成空列表，不影响问答主链路。
-  const refreshSessions = useCallback(async () => {
+  // 一个账号只有一个会话：登录后（或刷新页面）按 user_id 载入该会话的历史。
+  // 加 cancelled 守卫：若历史还在路上用户就退出了登录，避免旧账号的消息被回填到当前界面。
+  useEffect(() => {
     if (!userId) {
-      setSessions([]);
-      return;
+      setLoadingHistory(false);
+      return undefined;
     }
-    try {
-      const data = await chatAPI.listSessions(userId);
-      setSessions(data.sessions || []);
-    } catch (error) {
-      setSessions([]);
-    }
+    let cancelled = false;
+    setLoadingHistory(true);
+    const loadHistory = async () => {
+      try {
+        const response = await chatAPI.getHistory(userId);
+        if (cancelled) return;
+        const historyMessages = response.messages || [];
+        const summaryMessage = response.summary
+          ? [{
+              role: 'assistant',
+              content: `【此前对话摘要】\n${response.summary}`,
+              timestamp: response.timestamp,
+            }]
+          : [];
+        setMessages([...summaryMessage, ...historyMessages]);
+      } catch (error) {
+        // 拉不到历史不影响继续问答，聊天区保持为空即可
+      } finally {
+        if (!cancelled) setLoadingHistory(false);
+      }
+    };
+    loadHistory();
+    return () => {
+      cancelled = true;
+    };
   }, [userId]);
 
-  // 进页面（或换账号登录后）就列出该账号名下的历史会话
-  useEffect(() => {
-    refreshSessions();
-  }, [refreshSessions]);
-
-  // 登录 / 注册成功：记下身份，主界面随即渲染并拉取该账号的会话列表
+  // 登录 / 注册成功：记下身份；主界面随即渲染并载入该账号的历史
   const handleAuthenticated = (newUserId, newUsername) => {
     persistIdentity(newUserId, newUsername);
     setIdentity({ userId: newUserId, username: newUsername });
@@ -200,9 +202,7 @@ function App() {
   const handleLogout = () => {
     clearIdentity();
     setIdentity({ userId: '', username: '' });
-    setSessionId('');
     setMessages([]);
-    setSessions([]);
   };
 
   // 处理发送消息
@@ -221,15 +221,11 @@ function App() {
     setLoading(true);
 
     try {
-      // 发送到后端，sessionId为null时由后端生成新的session_id
+      // 后端按 userId 把这条消息落到该账号唯一的会话里
       const response = await chatAPI.sendMessage({
         question: inputText,
-        sessionId: sessionId, // 直接使用当前的sessionId，如果为null则由后端生成
-        userId, // 身份，后端据此隔离跨会话记忆
+        userId,
       });
-
-      // 更新会话ID（后端会返回正确的session_id）
-      setSessionId(response.session_id);
 
       // 添加AI回复到消息列表
       const aiMessage = {
@@ -238,8 +234,6 @@ function App() {
         timestamp: response.timestamp,
       };
       setMessages(prev => [...prev, aiMessage]);
-      // 新一轮问答后刷新侧边栏：新会话要出现，已有会话要按最近活跃排到最前
-      refreshSessions();
     } catch (error) {
       // 显示错误消息
       const errorMessage = {
@@ -259,57 +253,6 @@ function App() {
       e.preventDefault();
       handleSendMessage();
     }
-  };
-
-  // 把某段会话的历史载入主区域（后端会把较早轮次压缩成摘要，一并展示，
-  // 避免"加载历史后只剩最后几条"）
-  const loadSessionHistory = async (id) => {
-    const response = await chatAPI.getHistory(id);
-    const historyMessages = response.messages || [];
-    const summaryMessage = response.summary
-      ? [{
-          role: 'assistant',
-          content: `【此前对话摘要】\n${response.summary}`,
-          timestamp: response.timestamp,
-        }]
-      : [];
-    setMessages([...summaryMessage, ...historyMessages]);
-  };
-
-  // 点击侧边栏一条会话：切到该会话并载入它的历史；之后继续发送就接在这段对话上
-  const handleOpenSession = async (id) => {
-    if (id === sessionId) return;
-    setSessionId(id);
-    try {
-      await loadSessionHistory(id);
-    } catch (error) {
-      alert('加载历史记录失败');
-    }
-  };
-
-  // 清空历史记录
-  const handleClearHistory = async () => {
-    if (!sessionId) {
-      alert('当前没有会话');
-      return;
-    }
-
-    if (window.confirm('确定要清空当前会话的历史记录吗？')) {
-      try {
-        await chatAPI.deleteHistory(sessionId);
-        setMessages([]);
-        alert('历史记录已清空');
-      } catch (error) {
-        alert('清空历史记录失败');
-      }
-    }
-  };
-
-  // 新会话
-  const handleNewSession = () => {
-    // 清空当前会话状态，后端会在下次请求时生成新的session_id
-    setSessionId(null);
-    setMessages([]);
   };
 
   // 处理文件选择
@@ -362,7 +305,7 @@ function App() {
 
     try {
       const submitted = await chatAPI.uploadFile(
-        selectedFile, fileQuestion.trim() || null, sessionId, userId
+        selectedFile, fileQuestion.trim() || null, userId
       );
       const result = submitted.status === 'done'
         ? submitted
@@ -373,11 +316,6 @@ function App() {
         content: result.answer,
         timestamp: result.timestamp,
       }]);
-
-      // 更新会话ID（后端会返回正确的session_id）
-      setSessionId(result.session_id);
-      // 上传问答同样会新建/更新会话，侧边栏跟着刷新
-      refreshSessions();
 
       setSelectedFile(null);
       setFileQuestion('');
@@ -468,132 +406,78 @@ function App() {
       </header>
 
       <div className="main-container">
-        {/* 侧边栏 - 会话管理 */}
+        {/* 侧边栏 - 知识库管理 */}
         <aside className="sidebar">
-          <div className="session-section">
-            <h3>会话管理</h3>
-            <div className="session-controls">
-              <button 
-                onClick={handleNewSession}
-                className="btn btn-primary"
-              >
-                新会话
-              </button>
-              <button 
-                onClick={handleClearHistory}
-                className="btn btn-danger"
-              >
-                清空历史
-              </button>
-            </div>
+          <div className="knowledge-section">
+            <button
+              type="button"
+              className="section-toggle"
+              onClick={() => setShowKnowledge(prev => !prev)}
+              aria-expanded={showKnowledge}
+              aria-controls="knowledge-panel"
+            >
+              <span>知识库管理</span>
+              <span className="toggle-chevron" aria-hidden="true">▾</span>
+            </button>
 
-            <div className="session-list-section">
-              <h4>历史会话</h4>
-              {sessions.length === 0 ? (
-                <p className="session-hint">
-                  还没有历史会话，发送第一条消息后会出现在这里。
-                </p>
-              ) : (
-                <ul className="session-list">
-                  {sessions.map((item) => (
-                    <li key={item.session_id}>
-                      <button
-                        type="button"
-                        className={
-                          'session-list-item' +
-                          (item.session_id === sessionId ? ' active' : '')
-                        }
-                        onClick={() => handleOpenSession(item.session_id)}
-                        title={item.session_id}
-                      >
-                        <span className="session-item-title">
-                          {item.title || '未命名会话'}
-                        </span>
-                        <span className="session-item-time">
-                          {formatSessionTime(item.updated_at || item.created_at)}
-                        </span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-
-              <h4>身份 ID</h4>
-              <p className="session-hint">{userId}</p>
-              <p className="session-hint">跨会话记忆按该身份隔离，清除浏览器数据会重新生成</p>
-            </div>
-
-            <div className="knowledge-section">
-              <button
-                type="button"
-                className="section-toggle"
-                onClick={() => setShowKnowledge(prev => !prev)}
-                aria-expanded={showKnowledge}
-                aria-controls="knowledge-panel"
-              >
-                <span>知识库管理</span>
-                <span className="toggle-chevron" aria-hidden="true">▾</span>
-              </button>
-
-              {showKnowledge && (
+            {showKnowledge && (
               <div className="knowledge-panel" id="knowledge-panel">
-              <p className="section-hint">
-                添加的内容会写入知识库，供助手在回答时检索。
-              </p>
+                <p className="section-hint">
+                  添加的内容会写入知识库，供助手在回答时检索。
+                </p>
 
-              <div className="knowledge-item">
-                <h5>个人信息</h5>
-                <textarea
-                  value={selfIntroduction}
-                  onChange={(e) => setSelfIntroduction(e.target.value)}
-                  placeholder="输入你的个人信息..."
-                  className="knowledge-textarea"
-                  rows="3"
-                />
-                <button
-                  onClick={handleAddSelfIntroduction}
-                  className="btn btn-primary btn-small"
-                >
-                  添加
-                </button>
-              </div>
+                <div className="knowledge-item">
+                  <h5>个人信息</h5>
+                  <textarea
+                    value={selfIntroduction}
+                    onChange={(e) => setSelfIntroduction(e.target.value)}
+                    placeholder="输入你的个人信息..."
+                    className="knowledge-textarea"
+                    rows="6"
+                  />
+                  <button
+                    onClick={handleAddSelfIntroduction}
+                    className="btn btn-primary btn-small"
+                  >
+                    添加
+                  </button>
+                </div>
 
-              <div className="knowledge-item">
-                <h5>音乐理解</h5>
-                <textarea
-                  value={musicAnalysis}
-                  onChange={(e) => setMusicAnalysis(e.target.value)}
-                  placeholder="输入你对音乐的理解..."
-                  className="knowledge-textarea"
-                  rows="3"
-                />
-                <button
-                  onClick={handleAddMusicAnalysis}
-                  className="btn btn-primary btn-small"
-                >
-                  添加
-                </button>
-              </div>
+                <div className="knowledge-item">
+                  <h5>音乐理解</h5>
+                  <textarea
+                    value={musicAnalysis}
+                    onChange={(e) => setMusicAnalysis(e.target.value)}
+                    placeholder="输入你对音乐的理解..."
+                    className="knowledge-textarea"
+                    rows="6"
+                  />
+                  <button
+                    onClick={handleAddMusicAnalysis}
+                    className="btn btn-primary btn-small"
+                  >
+                    添加
+                  </button>
+                </div>
 
-              <div className="knowledge-item">
-                <h5>歌单</h5>
-                <textarea
-                  value={musicList}
-                  onChange={(e) => setMusicList(e.target.value)}
-                  placeholder="输入你喜欢的歌单..."
-                  className="knowledge-textarea"
-                  rows="3"
-                />
-                <button
-                  onClick={handleAddMusicList}
-                  className="btn btn-primary btn-small"
-                >
-                  添加
-                </button>
+                <div className="knowledge-item">
+                  <h5>歌单</h5>
+                  <textarea
+                    value={musicList}
+                    onChange={(e) => setMusicList(e.target.value)}
+                    placeholder="输入你喜欢的歌单..."
+                    className="knowledge-textarea"
+                    rows="6"
+                  />
+                  <button
+                    onClick={handleAddMusicList}
+                    className="btn btn-primary btn-small"
+                  >
+                    添加
+                  </button>
+                </div>
               </div>
-              </div>
-              )}
-            </div>
+            )}
           </div>
         </aside>
 
@@ -601,7 +485,11 @@ function App() {
         <main className="chat-container">
           {/* 消息列表 */}
           <div className="messages-container">
-            {messages.length === 0 ? (
+            {loadingHistory && messages.length === 0 ? (
+              <div className="empty-state">
+                <p>正在加载历史记录…</p>
+              </div>
+            ) : messages.length === 0 ? (
               <div className="empty-state">
                 <div className="empty-icon">🎵</div>
                 <h3>欢迎使用乐典音乐助手！</h3>

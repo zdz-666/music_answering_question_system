@@ -43,7 +43,6 @@ def process(task_id: str, payload: dict) -> dict:
             filename=filename,
             content=Path(payload["file_path"]).read_bytes(),
             question=payload.get("question"),
-            session_id=payload.get("session_id"),
             user_id=payload.get("user_id") or "",
         )
         span.output = {

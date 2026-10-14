@@ -67,7 +67,6 @@ def submit(
     filename: str,
     content: bytes,
     question: str | None,
-    session_id: str | None,
     user_id: str,
     request_id: str,
 ) -> str | None:
@@ -97,7 +96,6 @@ def submit(
                         "file_path": str(spool),
                         "filename": filename,
                         "question": question,
-                        "session_id": session_id,
                         "user_id": user_id,
                     },
                     ensure_ascii=False,

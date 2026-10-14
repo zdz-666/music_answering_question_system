@@ -34,12 +34,11 @@ export const chatAPI = {
 
   // 发送消息
   // 是否走知识库/网络检索由后端模型依据提问决定，前端不再传开关
-  // userId：用户身份，后端按它隔离情景记忆与用户画像（跨会话记忆的前提）
-  async sendMessage({ question, sessionId, userId }) {
+  // userId：用户身份，后端按它隔离情景记忆与用户画像，也是「一个账号一个会话」的归属键
+  async sendMessage({ question, userId }) {
     try {
       const response = await api.post('/api/chat', {
         question,
-        session_id: sessionId,
         user_id: userId,
       });
       return response.data;
@@ -49,11 +48,12 @@ export const chatAPI = {
     }
   },
 
-  // 获取历史记录
-  async getHistory(sessionId, number = 20) {
+  // 获取历史记录：按 user_id 取该账号唯一会话的最近消息
+  // 单会话下所有对话都堆在同一个会话里，默认多取一些，避免登录后只能看到最近几条
+  async getHistory(userId, number = 100) {
     try {
-      const response = await api.get(`/api/chat/history/${sessionId}`, {
-        params: { number }
+      const response = await api.get('/api/chat/history', {
+        params: { user_id: userId, number }
       });
       return response.data;
     } catch (error) {
@@ -62,45 +62,16 @@ export const chatAPI = {
     }
   },
 
-  // 列出该用户名下的历史会话（最近活跃在前），供侧边栏渲染。
-  // 返回 { sessions: [{session_id, title, created_at, updated_at}], total }
-  async listSessions(userId, number = 20) {
-    try {
-      const response = await api.get('/api/sessions', {
-        params: { user_id: userId, number }
-      });
-      return response.data;
-    } catch (error) {
-      console.error('获取会话列表失败:', error);
-      throw error;
-    }
-  },
-
-  // 删除历史记录
-  async deleteHistory(sessionId) {
-    try {
-      const response = await api.delete(`/api/chat/history/${sessionId}`);
-      return response.data;
-    } catch (error) {
-      console.error('删除历史记录失败:', error);
-      throw error;
-    }
-  },
-
   // 上传文件
-  // 传 sessionId / userId：上传也要落在同一个会话与同一个身份下，
-  // 否则每上传一次都会新建会话，情景记忆的归属也会出错
+  // 只传 userId：上传也落在同一个账号唯一的会话下；不再需要 session_id
   // 返回两种形态：{status:'queued', task_id}（解析在 worker 里跑，需轮询 getTask）
   //              {status:'done', answer, session_id, timestamp}（后端没 Redis，同步兜底直接给答案）
-  async uploadFile(file, question = null, sessionId = null, userId = null) {
+  async uploadFile(file, question = null, userId = null) {
     try {
       const formData = new FormData();
       formData.append('file', file);
       if (question) {
         formData.append('question', question);
-      }
-      if (sessionId) {
-        formData.append('session_id', sessionId);
       }
       if (userId) {
         formData.append('user_id', userId);

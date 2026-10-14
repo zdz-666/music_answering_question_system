@@ -11,17 +11,13 @@
 
 键设计（前缀复用 cache.key()，与缓存同一版本号）：
 
-    sess:{id}:meta   HASH    created_at / updated_at / next_id / user_id / title
+    sess:{id}:meta   HASH    created_at / updated_at / next_id / user_id
     sess:{id}:msgs   LIST    元素 = JSON {"id", "role", "content", "timestamp"}
     sess:{id}:sum    STRING  滚动摘要
 
-    另有按用户名下的会话索引，供前端侧边栏列出「我的历史会话」（原先只能靠手动输入
-    session_id 才能进入某段对话）：
-
-    sess:user:{digest(user_id)}:index   ZSET   member = session_id，score = 最近活跃时间
-
-    索引只在带 user_id 的真实用户链路上维护；索引里的成员可能先于会话过期，list_sessions
-    以 meta 是否存在为准过滤，并顺手把残留成员清出索引。
+每个账号只有一个会话：id 由 user_id 确定性派生（见 session_id_for），同一账号永远落在
+同一个会话上。因此不需要「新建会话 / 会话列表 / 删除历史」这类管理能力——侧边栏只保留
+知识库管理，消息照旧持久化在 Redis，只是不再有多会话。
 
 与 SQLite 版的语义对应（函数签名与行为全部保持一致，调用方零改动）：
 
@@ -66,15 +62,6 @@ if redis.call('EXISTS', KEYS[1]) == 0 then
 end
 local id = redis.call('HINCRBY', KEYS[1], 'next_id', 1)
 redis.call('HSET', KEYS[1], 'updated_at', ARGV[1])
-
--- 首条用户消息截断后作为会话标题（标题已写定就不再改）。截断在 Python 侧做，
--- 这里不做 string.sub：按字节截断会把中文切到半个字符，落成非法 UTF-8。
-if ARGV[2] == 'user' and ARGV[7] ~= '' then
-    local title = redis.call('HGET', KEYS[1], 'title')
-    if not title or title == '' then
-        redis.call('HSET', KEYS[1], 'title', ARGV[7])
-    end
-end
 
 redis.call('RPUSH', KEYS[2], cjson.encode({
     id = id, role = ARGV[2], content = ARGV[3], timestamp = ARGV[4]
@@ -136,41 +123,6 @@ def _key(session_id: str, suffix: str) -> str:
     return cache.key("sess", session_id, suffix)
 
 
-def _user_index_key(user_id: str) -> str:
-    """该用户名下会话索引的键名。
-
-    用 digest 把 user_id 压成定长十六进制：user_id 是前端生成、可能含冒号等分隔符的
-    自由文本，直接拼进键名会与键本身「: 分隔」的结构混淆。
-    """
-    return cache.key("sess", "user", cache.digest(user_id), "index")
-
-
-def _index_session(client, session_id: str, user_id: str, score: float) -> None:
-    """把会话挂到该用户名下的索引，并把分值刷成最近活跃时间，同时续期。
-
-    user_id 为空（评测脚本、裸调用）时不建索引——侧边栏只服务真实用户。
-    对已存在但先前没带 user_id 的会话，这里相当于补挂一次。
-    """
-    if not user_id:
-        return
-    index_key = _user_index_key(user_id)
-    pipe = client.pipeline(transaction=False)
-    pipe.zadd(index_key, {session_id: score})
-    pipe.expire(index_key, SESSION_TTL_SECONDS)
-    pipe.execute()
-
-
-def _session_title(message: ChatMessage) -> str:
-    """会话标题：首条用户消息折叠空白后截前 40 字；非用户消息返回空串（Lua 侧据此不写）。
-
-    截断放在 Python 侧，因为 message.content 是已解码的 str，按字符切片不会把中文
-    劈成半个字符（Redis 的 Lua string.sub 是按字节的）。
-    """
-    if message.role != "user":
-        return ""
-    return " ".join((message.content or "").split())[:40]
-
-
 def _touch(client, session_id: str) -> None:
     """把会话的三个键一起续到 SESSION_TTL_SECONDS，并成一次往返。"""
     pipe = client.pipeline(transaction=False)
@@ -210,7 +162,7 @@ def init_db() -> None:
 
 
 def new_session_id() -> str:
-    """时间戳 + 随机后缀。
+    """时间戳 + 随机后缀（仅供没有 user_id 的裸调用兜底）。
 
     用 len(sessions) 当后缀的话，多 worker 下各进程各自计数，同一秒内会算出相同的 id；
     换成随机后缀后不需要任何共享计数器。
@@ -218,23 +170,99 @@ def new_session_id() -> str:
     return f"session_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
 
-def get_or_create_session(session_id: str | None, user_id: str = "") -> str:
-    """session_id 已存在就用它，否则新建一个并返回。
+def session_id_for(user_id: str) -> str:
+    """由 user_id 确定性派生会话 id：同一账号永远对应同一个会话。
 
-    取到已有会话时顺手续一次 TTL：每次对话开头都会调这里，于是「活跃会话不过期」。
-    user_id 非空时把会话挂到该用户名下的索引（分值 = 本次活跃时间），供侧边栏列会话；
-    没有 user_id 的调用方（评测、裸 curl）不建索引。
+    digest 把自由文本的 user_id 压成定长十六进制，避免它含「:」等分隔符时与键名结构混淆。
+    """
+    return f"sess_{cache.digest(user_id)}"
+
+
+def _legacy_index_key(user_id: str) -> str:
+    """单会话化之前用来记录「该用户名下有哪些会话」的 ZSET 键，只在迁移时读一次。"""
+    return cache.key("sess", "user", cache.digest(user_id), "index")
+
+
+def _migrate_legacy_sessions(client, user_id: str, session_id: str) -> bool:
+    """把单会话化之前散落在旧会话里的消息合并进该账号唯一的会话。
+
+    旧方案每条对话一个会话 id，另有 per-user ZSET 索引记录「该用户名下的会话 id」；
+    改成由 user_id 确定性派生的单会话后，旧会话在新 id 下查不到，登录后也就看不到历史。
+    这里在该账号还没有消息时合并一次（只搬消息，不搬旧摘要），随后删掉旧键与索引，
+    保证只做一次。没有旧会话时返回 False，由调用方去建空会话。
+    """
+    index_key = _legacy_index_key(user_id)
+    legacy_ids = [_decode(raw) for raw in client.zrange(index_key, 0, -1)]
+    if not legacy_ids:
+        return False
+
+    pipe = client.pipeline(transaction=False)
+    for legacy_id in legacy_ids:
+        pipe.lrange(_key(legacy_id, "msgs"), 0, -1)
+    raw_lists = pipe.execute()
+
+    merged = []
+    for raw_list in raw_lists:
+        for raw in raw_list or []:
+            record = _item(raw)
+            # 重排 id：单会话里 id 必须连续递增，「按 id <= max_id 删消息」的压缩才成立
+            record["id"] = len(merged) + 1
+            merged.append(record)
+    if not merged:
+        return False
+
+    stamp = datetime.now().isoformat()
+    # 写合并结果与删旧键放进同一个事务：要么都成，要么都不做，
+    # 不会出现「旧数据删了、新数据没写」的中间态。
+    pipe = client.pipeline(transaction=True)
+    pipe.hset(
+        _key(session_id, "meta"),
+        mapping={
+            "created_at": stamp,
+            "updated_at": stamp,
+            "next_id": len(merged),
+            "user_id": user_id,
+        },
+    )
+    pipe.rpush(
+        _key(session_id, "msgs"),
+        *[json.dumps(record, ensure_ascii=False) for record in merged],
+    )
+    pipe.ltrim(_key(session_id, "msgs"), -MAX_MESSAGES_HARD, -1)
+    for suffix in ("meta", "msgs", "sum"):
+        pipe.expire(_key(session_id, suffix), SESSION_TTL_SECONDS)
+    pipe.delete(index_key)
+    for legacy_id in legacy_ids:
+        pipe.delete(
+            _key(legacy_id, "meta"),
+            _key(legacy_id, "msgs"),
+            _key(legacy_id, "sum"),
+        )
+    pipe.execute()
+    return True
+
+
+def get_or_create_session(user_id: str = "") -> str:
+    """返回该账号唯一的会话 id，不存在则创建。
+
+    - 带 user_id（正常登录链路）：id 由 user_id 派生，同一账号永远是同一个会话；
+      命中已有会话时顺手续一次 TTL——每次对话开头都会调这里，于是活跃会话不过期。
+    - 不带 user_id（裸 curl / 评测兜底）：退化成一次性随机会话，不持久化任何身份。
     """
     client = _client()
     user_id = (user_id or "").strip()
-    now = datetime.now()
-    if session_id and client.exists(_key(session_id, "meta")):
+    session_id = session_id_for(user_id) if user_id else new_session_id()
+
+    # 已经有消息：直接续期返回（LLEN 为 0 也涵盖「键不存在」，省掉一次 EXISTS）
+    if client.llen(_key(session_id, "msgs")):
         _touch(client, session_id)
-        _index_session(client, session_id, user_id, now.timestamp())
         return session_id
 
-    session_id = new_session_id()
-    stamp = now.isoformat()
+    # 该账号还没有消息：先把单会话化之前的旧会话合并进来，让登录后能看到历史
+    if user_id and _migrate_legacy_sessions(client, user_id, session_id):
+        return session_id
+
+    stamp = datetime.now().isoformat()
     pipe = client.pipeline(transaction=False)
     pipe.hset(
         _key(session_id, "meta"),
@@ -243,13 +271,11 @@ def get_or_create_session(session_id: str | None, user_id: str = "") -> str:
             "updated_at": stamp,
             "next_id": 0,
             "user_id": user_id,
-            "title": "",
         },
     )
     for suffix in ("meta", "msgs", "sum"):
         pipe.expire(_key(session_id, suffix), SESSION_TTL_SECONDS)
     pipe.execute()
-    _index_session(client, session_id, user_id, now.timestamp())
     return session_id
 
 
@@ -274,7 +300,6 @@ def add_message(session_id: str, message: ChatMessage) -> None:
             message.timestamp or datetime.now().isoformat(),
             SESSION_TTL_SECONDS,
             MAX_MESSAGES_HARD,
-            _session_title(message),
         ],
     )
 
@@ -309,72 +334,6 @@ def list_messages(session_id: str, number: int) -> list[ChatMessage] | None:
         )
         for item in (_item(raw_item) for raw_item in raw)
     ]
-
-
-def clear_messages(session_id: str) -> bool:
-    """清空消息与摘要；会话不存在返回 False。
-
-    保留 meta 是有意的：删历史之后会话仍然存在，再查历史会返回空列表而不是 404。
-    摘要必须一起清掉，否则「清空历史」之后助手仍然记得之前聊过什么。
-    """
-    client = _client()
-    if not client.exists(_key(session_id, "meta")):
-        return False
-
-    client.delete(
-        _key(session_id, "msgs"),
-        _key(session_id, "sum"),
-    )
-    return True
-
-
-def list_sessions(user_id: str, number: int = 20) -> list[dict]:
-    """按最近活跃倒序列出该用户名下的会话，供前端侧边栏渲染。
-
-    返回 [{"session_id", "title", "created_at", "updated_at"}]，最新的在前；
-    user_id 为空（评测等无身份调用）时返回空列表。
-
-    索引成员可能已经先于会话过期（三个会话键到 TTL 被删、索引成员还在），
-    这里以 meta 是否存在为准过滤，并把残留成员顺手从索引里清掉，避免越积越多。
-    """
-    client = _client()
-    user_id = (user_id or "").strip()
-    if not user_id:
-        return []
-
-    index_key = _user_index_key(user_id)
-    session_ids = [
-        _decode(raw) for raw in client.zrevrange(index_key, 0, max(number, 1) - 1)
-    ]
-    if not session_ids:
-        return []
-
-    # 一次 pipeline 把 N 个 meta 拿回来，避免侧边栏列出 20 条就打 20 次往返
-    pipe = client.pipeline(transaction=False)
-    for session_id in session_ids:
-        pipe.hgetall(_key(session_id, "meta"))
-    metas = pipe.execute()
-
-    sessions = []
-    stale = []
-    for session_id, raw_meta in zip(session_ids, metas):
-        if not raw_meta:
-            stale.append(session_id)
-            continue
-        meta = {_decode(key): _decode(value) for key, value in raw_meta.items()}
-        sessions.append(
-            {
-                "session_id": session_id,
-                "title": meta.get("title") or "",
-                "created_at": meta.get("created_at"),
-                "updated_at": meta.get("updated_at"),
-            }
-        )
-
-    if stale:
-        client.zrem(index_key, *stale)
-
-    return sessions
 
 
 def load_context(session_id: str, limit: int = AGENT_HISTORY_LIMIT) -> dict:

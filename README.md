@@ -106,7 +106,7 @@ bishe/
 ├── .redis/                 # Redis 容器数据卷（会话 / 缓存都在这，运行时生成，不入库；容器启动命令见下文）
 └── music-chatbot-frontend/ # React 前端
     └── src/
-        ├── App.js          # 聊天界面、会话管理、知识库录入、文件上传
+        ├── App.js          # 聊天界面、登录、知识库录入、文件上传
         └── service/api.js  # axios 封装的后端接口调用
 ```
 
@@ -181,12 +181,17 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 
 | 键 | 类型 | 内容 |
 | --- | --- | --- |
-| `{prefix}:sess:{id}:meta` | HASH | `created_at` / `updated_at` / `next_id`（消息自增 id）/ `user_id`（会话归属）/ `title`（首条用户消息截断） |
+| `{prefix}:sess:{id}:meta` | HASH | `created_at` / `updated_at` / `next_id`（消息自增 id）/ `user_id`（会话归属） |
 | `{prefix}:sess:{id}:msgs` | LIST | 消息，元素是 JSON `{id, role, content, timestamp}` |
 | `{prefix}:sess:{id}:sum` | STRING | 压缩摘要（由 agent 的压缩结果写入，见「上下文压缩」） |
-| `{prefix}:sess:user:{digest(user_id)}:index` | ZSET | 该用户名下的会话索引（member = `session_id`，score = 最近活跃时间），供 `GET /api/sessions` 渲染侧边栏 |
 | `{prefix}:user:{digest(username)}` | HASH | 账号记录：`user_id` / `username` / `salt` / `password_hash`（pbkdf2 加盐哈希）/ `created_at`；不设 TTL |
 
+- **一个账号只有一个会话**：会话 id 由 `user_id` 确定性派生（`session_id_for`），同一账号永远落在同一个
+  会话上，因此不需要「新建会话 / 会话列表 / 删除历史」这类管理能力——侧边栏只保留知识库管理。
+  历史接口按 `user_id` 查询该账号唯一的会话。
+- **旧会话一次性并入**：单会话化之前，同一账号可能散落在多个旧会话里（旧方案另有
+  `sess:user:{digest}:index` 索引记录归属）。账号还没有消息时，`_migrate_legacy_sessions`
+  会把旧会话的消息按时间顺序合并进该账号唯一的会话，并删掉旧键与索引，因此登录后仍能看到改造前的历史。
 - **会话是正确性依赖，不是缓存**：缓存 / 限流 / 队列拿不到 Redis 可以降级，会话不行——
   降级只会把「读不到历史」伪装成「这是一段新对话」，属于静默的数据错误。因此这里取连接用
   `cache.require_client()`，拿不到就抛错（缺 `REDIS_URL` 或连不上时，`init_db()` 在启动阶段即报错）。
@@ -218,8 +223,8 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
   `memory_path` 再做一次 resolve 校验，挡住文件名里的 `..` / 绝对路径穿越到别的用户目录。
 - **类型与去重**：记忆类型限定 `user` / `feedback` / `project` / `reference`；落盘前按 slug、
   description、body 三重归一化比对，命中已有记录则不写（幂等）；命中「本次会话 / 暂时」等临时措辞的候选直接丢弃。
-- **身份隔离**：前端首次访问生成 `user_id` 存进 `localStorage`（`music_rag_user_id`），随请求带给后端；
-  「跨会话」即同一 `user_id` 下的多个 `session_id`。
+- **身份隔离**：账号登录后得到 `user_id`，前端存进 `localStorage`（`music_rag_user_id`、`music_rag_username`），
+  随请求带给后端。同一 `user_id` 对应唯一一个会话，跨轮次的对话都落在它上面，长期记忆也按该身份隔离。
 - 可调参数：`MEMORY_ROOT`、`MEMORY_RECALL_CHAR_LIMIT`、`MEMORY_RECALL_TOP_K`、
   `MEMORY_CONSOLIDATE_THRESHOLD`、`MEMORY_CONSOLIDATE_CHAR_LIMIT`（见 `.env.example`）。
 
@@ -343,10 +348,8 @@ POST /api/upload ──► 限流 ──► 写暂存文件 + 入队（Redis RPU
 | --- | --- | --- |
 | POST | `/api/auth/register` | 注册账号（`{username, password}`），返回该账号的 `user_id`；账号已存在返回 409 |
 | POST | `/api/auth/login` | 登录（`{username, password}`），返回该账号的 `user_id`；账号或密码不对返回 401 |
-| POST | `/api/chat` | 发送消息，返回答案与 `session_id` |
-| GET | `/api/chat/history/{session_id}` | 查询会话历史（`number` 可选，默认 20） |
-| DELETE | `/api/chat/history/{session_id}` | 清空指定会话历史 |
-| GET | `/api/sessions` | 按 `user_id` 列出其名下的历史会话（最近活跃在前，`number` 可选、默认 20），供前端侧边栏渲染；`user_id` 必填 |
+| POST | `/api/chat` | 发送消息，返回答案与 `session_id`（会话由 `user_id` 派生，一个账号唯一） |
+| GET | `/api/chat/history` | 按 `user_id` 查询该账号唯一会话的历史（`number` 可选，默认 20）；`user_id` 必填 |
 | POST | `/api/upload` | 上传 `.pdf` / `.docx` / 图片（`.png` `.jpg` `.jpeg` `.gif` `.webp`）并提问（含图片描述），其它格式返回 400。有 Redis 时返回 `202` + `task_id`（202 表示已入队，不是已完成），无 Redis 时退回同步处理、返回 `200` + 答案 |
 | GET | `/api/task/{task_id}` | 轮询上传任务：`status` 为 `queued` / `running` / `done` / `failed`，`done` 带答案，`failed` 带 `error`；任务不存在或已过期返回 404 |
 | POST | `/api/knowledge/self-introduction` | 写入个人信息 |

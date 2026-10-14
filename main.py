@@ -17,8 +17,6 @@ from models import (
     ChatMessage,
     ChatResponse,
     ChatHistoryResponse,
-    SessionListResponse,
-    SessionSummary,
     TaskStatusResponse,
     UploadResponse,
 )
@@ -32,12 +30,10 @@ from observability import (
 )
 from session_store import (
     add_message,
-    clear_messages,
     get_or_create_session,
     get_summary,
     init_db,
     list_messages,
-    list_sessions,
 )
 
 
@@ -110,8 +106,8 @@ async def chat(request: Request, query: QueryRequest):
     # Redis 不可用时 ratelimit 内部直接放行，不会因为限流组件故障拒掉正常请求。
     await ratelimit.enforce("chat", request, user_id)
 
-    # user_id 一并传入：会话除了存消息，还会挂到该用户名下的索引，供侧边栏列历史会话
-    session_id = get_or_create_session(query.session_id, user_id)
+    # 一个账号只有一个会话：id 由 user_id 确定性派生，同一账号永远落在同一个会话上。
+    session_id = await run_in_threadpool(get_or_create_session, user_id)
 
     # rag.get_result 内部走 agent_loop（同步阻塞：LLM / 检索 / 网络 / Redis），
     # 直接在 async 端点里调用会占住事件循环，同一 worker 上的其它请求全部排队。
@@ -122,9 +118,13 @@ async def chat(request: Request, query: QueryRequest):
         span.output = answer
 
     # 本轮的问答在 agent 返回后再落库：agent 是在「本轮提问落库之前」加载的历史，
-    # 这样当前提问不会被重复计入上下文。
-    add_message(session_id, ChatMessage(role="user", content=query.question))
-    add_message(session_id, ChatMessage(role="assistant", content=answer))
+    # 这样当前提问不会被重复计入上下文。Redis 写入同样下沉线程池。
+    await run_in_threadpool(
+        add_message, session_id, ChatMessage(role="user", content=query.question)
+    )
+    await run_in_threadpool(
+        add_message, session_id, ChatMessage(role="assistant", content=answer)
+    )
 
     response = ChatResponse(
         answer=answer,
@@ -134,44 +134,23 @@ async def chat(request: Request, query: QueryRequest):
 
     return response
 
-@app.get("/api/chat/history/{session_id}", response_model=ChatHistoryResponse)
-async def get_history(session_id: str, number: int = Query(20, ge=1, le = 100)):
-    messages = list_messages(session_id, number)
-    if messages is None:
-        raise HTTPException(status_code=404, detail="对话不存在")
+# 一个账号只有一个会话：历史按 user_id 查，不再需要 session_id。
+@app.get("/api/chat/history", response_model=ChatHistoryResponse)
+async def get_history(
+    user_id: str = Query(..., min_length=1, description="用户身份，每个账号唯一一个会话"),
+    number: int = Query(20, ge=1, le=100),
+):
+    """加载该账号唯一会话的最近消息，供聊天区回填历史。"""
+    session_id = await run_in_threadpool(get_or_create_session, user_id)
+    messages = await run_in_threadpool(list_messages, session_id, number) or []
+    summary = await run_in_threadpool(get_summary, session_id)
 
-    response = ChatHistoryResponse(
+    return ChatHistoryResponse(
         session_id=session_id,
         messages=messages,
         total=len(messages),
         timestamp=datetime.now().isoformat(),
-        summary=get_summary(session_id),
-    )
-
-    return response
-
-@app.delete("/api/chat/history/{session_id}")
-async def delete_history(session_id: str):
-    if not clear_messages(session_id):
-        raise HTTPException(status_code=404, detail="对话不存在")
-
-    return {"message": "对话历史已删除",
-            "session_id": session_id}
-
-@app.get("/api/sessions", response_model=SessionListResponse)
-async def get_sessions(
-    user_id: str = Query(..., min_length=1, description="用户身份，会话按它隔离"),
-    number: int = Query(20, ge=1, le=100),
-):
-    """列出该用户名下的历史会话（最近活跃在前），供前端侧边栏渲染。
-
-    会话数据在 Redis 里，读一批 meta 是阻塞 IO，与其它端点一致下沉线程池。
-    user_id 是必填：没有身份就没有「我的会话」这个概念。
-    """
-    sessions = await run_in_threadpool(list_sessions, user_id, number)
-    return SessionListResponse(
-        sessions=[SessionSummary(**item) for item in sessions],
-        total=len(sessions),
+        summary=summary,
     )
 
 @app.post("/api/upload", response_model=UploadResponse, status_code=202)
@@ -180,7 +159,6 @@ async def upload_file(
     response: Response,
     file: UploadFile = File(...),
     question: Optional[str] = Form(None),
-    session_id: Optional[str] = Form(None),
     user_id: Optional[str] = Form(None),
 ):
     # 限流放在 file.read() 之前：上传要走 VLM 逐张识图，比 chat 更贵，
@@ -199,7 +177,6 @@ async def upload_file(
         filename=file.filename,
         content=content,
         question=question,
-        session_id=session_id,
         user_id=user_id,
         request_id=get_request_id(),
     )
@@ -213,7 +190,6 @@ async def upload_file(
             filename=file.filename,
             content=content,
             question=question,
-            session_id=session_id,
             user_id=user_id,
         )
     except document_loader.UnsupportedFormatError as exc:
